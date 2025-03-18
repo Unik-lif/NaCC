@@ -263,28 +263,34 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	config.Cgroups = c
 	// set linux-specific config
 	if spec.Linux != nil {
+        // 将spec中的namespace信息映射到configs中
+        // 将挂载传播选项字符串映射到unix常量
+        // 做了以上事情之后，配置过程已经得到了一定的简化
 		initMaps()
 
+        // 文件系统的挂载传播选项，决定了之后的容器的文件系统挂载是否会受到宿主机的影响，或者反过来影响到宿主机
 		if spec.Linux.RootfsPropagation != "" {
 			var exists bool
 			if config.RootPropagation, exists = mountPropagationMapping[spec.Linux.RootfsPropagation]; !exists {
 				return nil, fmt.Errorf("rootfsPropagation=%v is not supported", spec.Linux.RootfsPropagation)
 			}
+            // 是NoPivotRoot，而且传播选项还是private，这种情况是不存在的
 			if config.NoPivotRoot && (config.RootPropagation&unix.MS_PRIVATE != 0) {
 				return nil, errors.New("rootfsPropagation of [r]private is not safe without pivot_root")
 			}
 		}
-
+        // 遍历我们spec文件中指定的不同的命名空间，如果命名空间类并不被支持，或者出现了重复，则返回错误
 		for _, ns := range spec.Linux.Namespaces {
 			t, exists := namespaceMapping[ns.Type]
 			if !exists {
 				return nil, fmt.Errorf("namespace %q does not exist", ns)
 			}
-			if config.Namespaces.Contains(t) {
+            if config.Namespaces.Contains(t) {
 				return nil, fmt.Errorf("malformed spec file: duplicated ns %q", ns)
 			}
 			config.Namespaces.Add(t, ns.Path)
 		}
+        // 网络的命名空间，如果是私有的，自然写个loopback就行
 		if config.Namespaces.IsPrivate(configs.NEWNET) {
 			config.Networks = []*configs.Network{
 				{
@@ -292,6 +298,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 				},
 			}
 		}
+        // 如果包含用户命名空间，则调用setupserNamespace函数设置用户命名空间，处理好这边的挂载点的ID映射
 		if config.Namespaces.Contains(configs.NEWUSER) {
 			if err := setupUserNamespace(spec, config); err != nil {
 				return nil, err
@@ -315,6 +322,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		config.MountLabel = spec.Linux.MountLabel
 		config.Sysctl = spec.Linux.Sysctl
 		config.TimeOffsets = spec.Linux.TimeOffsets
+        // Seccomp机制，限制进程对于系统调用的使用
 		if spec.Linux.Seccomp != nil {
 			seccomp, err := SetupSeccomp(spec.Linux.Seccomp)
 			if err != nil {
@@ -322,6 +330,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 			}
 			config.Seccomp = seccomp
 		}
+        // Intel的某个特殊的机制
 		if spec.Linux.IntelRdt != nil {
 			config.IntelRdt = &configs.IntelRdt{
 				ClosID:        spec.Linux.IntelRdt.ClosID,
@@ -329,10 +338,13 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 				MemBwSchema:   spec.Linux.IntelRdt.MemBwSchema,
 			}
 		}
+        // 与进程运行时所相关的选项，允许修改进程的某些行为
+        // 似乎主要时为了调整进程的ABI行为，和架构有点关系
 		if spec.Linux.Personality != nil {
 			if len(spec.Linux.Personality.Flags) > 0 {
 				logrus.Warnf("ignoring unsupported personality flags: %+v because personality flag has not supported at this time", spec.Linux.Personality.Flags)
 			}
+            // 这边会返回，当前Linux环境是否支持所需要的Personality特性
 			domain, err := getLinuxPersonalityFromStr(string(spec.Linux.Personality.Domain))
 			if err != nil {
 				return nil, err
@@ -351,9 +363,11 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	// Only set it if the container will have its own cgroup
 	// namespace and the cgroupfs will be mounted read/write.
 	//
+    // 检查容器是否有自己的cgroup命名空间
 	hasCgroupNS := config.Namespaces.IsPrivate(configs.NEWCGROUP)
 	hasRwCgroupfs := false
 	if hasCgroupNS {
+        // 检查是否容器挂载了可读写的cgroup文件系统
 		for _, m := range config.Mounts {
 			if m.Source == "cgroup" && filepath.Clean(m.Destination) == "/sys/fs/cgroup" && (m.Flags&unix.MS_RDONLY) == 0 {
 				hasRwCgroupfs = true
@@ -367,9 +381,12 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		// which is not necessarily UID 0 in the container
 		// namespace (e.g., an unprivileged UID in the host
 		// user namespace).
+        // 获取容器内运行进程的UID
 		processUid = int(spec.Process.User.UID)
 	}
 	if hasCgroupNS && hasRwCgroupfs {
+        // 容器内的UID转换为宿主的UID
+        // 宿主机UID为cgroup的持有者
 		ownerUid, err := config.HostUID(processUid)
 		// There are two error cases; we can ignore both.
 		//
@@ -385,7 +402,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 			config.Cgroups.OwnerUID = &ownerUid
 		}
 	}
-
+    // 进程属性与能力的限制
 	if spec.Process != nil {
 		config.OomScoreAdj = spec.Process.OOMScoreAdj
 		config.NoNewPrivileges = spec.Process.NoNewPrivileges
@@ -415,8 +432,10 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		}
 
 	}
+    // 钩子并不总是必要的
 	createHooks(spec, config)
 	config.Version = specs.Version
 	return config, nil
 }
 ```
+这里出现了很多我没见过的名词，需要仔细地学习，了解其大意，可能也是create函数中最核心地一个部分，即通过手写地spec对应地config.json来做配置config
