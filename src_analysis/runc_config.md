@@ -1,0 +1,2 @@
+## runC权限配置
+runC最终调用的是libcontainer，这里涉及许多不同的安全机制配置
