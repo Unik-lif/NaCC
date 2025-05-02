@@ -1,4 +1,7 @@
 ## Create流程分析
+### 配置文件spec与其余设置
+重点放在容器落实的机制，原理层面。
+
 前几天的分析都比较小打小闹，有一些细节被我忽略了，而且网上的代码解析质量都曾差不齐的，以及代码版本可能存在不同，很难看，不如自己来。
 
 现在着重来看这一部分。
@@ -126,6 +129,7 @@ func startContainer(context *cli.Context, action CtAct, criuOpts *libcontainer.C
 		return -1, err
 	}
 
+	// 通过notifySocket和systemd来进行通信，监控容器状态
 	if notifySocket != nil {
 		if err := notifySocket.setupSocketDirectory(); err != nil {
 			return -1, err
@@ -158,6 +162,7 @@ func startContainer(context *cli.Context, action CtAct, criuOpts *libcontainer.C
 		criuOpts:        criuOpts,
 		init:            true,
 	}
+	// spec.Process表示给container process做configuration的Process
 	return r.run(spec.Process)
 }
 ```
@@ -508,19 +513,25 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	if err := validate.Validate(config); err != nil {
 		return nil, err
 	}
+	// 建一个root作为根地址 The root is a state directory which many containers can share.
+	// 如果目录已经存在，mkdirall并不会报错
+	// If path is already a directory, MkdirAll does nothing and returns nil.
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
+	// 避免路径逃逸，保证信息将会被存放在root下
+	// root对应的路径在上面已经建立起来了
 	stateDir, err := securejoin.SecureJoin(root, id)
 	if err != nil {
 		return nil, err
 	}
+	// 按照常理来说会得到一个好的StateDir，记录root目录下id存放的地址，然后解析也将会是正确的
 	if _, err := os.Stat(stateDir); err == nil {
 		return nil, ErrExist
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-
+	// 根据config.Cgroups信息来得到对应版本的cgroup manager
 	cm, err := manager.New(config.Cgroups)
 	if err != nil {
 		return nil, err
@@ -533,6 +544,7 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	// probably true in almost all scenarios). Checking all the hierarchies
 	// would be too expensive.
 	if cm.Exists() {
+		// 读cgroup.procs下有哪些进程
 		pids, err := cm.GetAllPids()
 		// Reading PIDs can race with cgroups removal, so ignore ENOENT and ENODEV.
 		if err != nil && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENODEV) {
@@ -545,6 +557,8 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 
 	// Check that cgroup is not frozen. Do not use Exists() here
 	// since in cgroup v1 it only checks "devices" controller.
+	// Freezer是用于冻结cgroup下进程的东西
+	// 当前容器还没有跑起来，freezer不应该处于冻结状态
 	st, err := cm.GetFreezerState()
 	if err != nil {
 		return nil, fmt.Errorf("unable to get cgroup freezer state: %w", err)
@@ -554,9 +568,12 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	}
 
 	// Parent directory is already created above, so Mkdir is enough.
+	// root对应的路径已经建立起来了，现在则考虑把stateDir也建立起来
+	// 每个容器真正自身对应的路径，其他人似乎是有执行的权利
 	if err := os.Mkdir(stateDir, 0o711); err != nil {
 		return nil, err
 	}
+	// 建立一个Container的数据结构
 	c := &Container{
 		id:              id,
 		stateDir:        stateDir,
@@ -568,7 +585,11 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	return c, nil
 }
 ```
+根据config中的信息，做了下面的事情
+- 为容器创建路径，id与stateDir
+- 为容器配置其所对应的config和cgroupManager（版本需要合适）
 
+一些简单的检查功能放在这边了
 ```go
 func Validate(config *configs.Config) error {
 	checks := []check{
@@ -625,5 +646,505 @@ func Validate(config *configs.Config) error {
 		}
 	}
 	return nil
+}
+```
+结论，create流程目前做的事情是
+- 根据spec配置了config信息，有很多杂七杂八锅碗瓢盆的东西
+- 做了基本的权限配置检查，防止其不合理
+- 调用libcontainer的Create，创建了一个Container数据结构体，内嵌了其可被复用的root路径地址，和自身用的StateDir路径地址
+
+### runner机制
+runc程序有较好的封装，我们接下来重点关注runner在诸如create，start等容器操作中扮演的角色
+
+在建立完相关的数据结构后，startContainer中含有下面的部分
+```go
+// init表示确实是第一个进程
+r := &runner{
+	enableSubreaper: !context.Bool("no-subreaper"),
+	shouldDestroy:   !context.Bool("keep"),
+	container:       container,
+	listenFDs:       listenFDs,
+	notifySocket:    notifySocket,
+	consoleSocket:   context.String("console-socket"),
+	pidfdSocket:     context.String("pidfd-socket"),
+	detach:          context.Bool("detach"),
+	pidFile:         context.String("pid-file"),
+	preserveFDs:     context.Int("preserve-fds"),
+	action:          action,
+	criuOpts:        criuOpts,
+	init:            true,
+}
+return r.run(spec.Process)
+```
+只在这里确实看不出这些字段的作用，我们看run操作
+```go
+func (r *runner) run(config *specs.Process) (int, error) {
+	var err error
+	// defer会把下面的函数延迟到run函数跑完再跑，如果出错，直接销毁
+	defer func() {
+		if err != nil {
+			r.destroy()
+		}
+	}()
+	// 容器要么依赖分配的tty去和终端链接，要么不需要tty，在这两种情况下，分别需要或者不需要设置控制台socket
+	// 排查的是这个配置问题
+	if err = r.checkTerminal(config); err != nil {
+		return -1, err
+	}
+	// 将配置用的进程config映射到libcontainer内部
+	// 其对应的UID，GID等配置都按照spec.Process中的配置来
+	process, err := newProcess(config)
+	if err != nil {
+		return -1, err
+	}
+	// 在 create 情况下，r.init 为 True，确实是第一个进程
+	// 可以理解成 process 是 config 在 container 中的映射，并没有真的新创建了一个新的进程
+	process.LogLevel = strconv.Itoa(int(logrus.GetLevel()))
+	// Populate the fields that come from runner.
+	process.Init = r.init
+	// 在create中似乎这个变量没有被初始化
+	process.SubCgroupPaths = r.subCgroupPaths
+	if len(r.listenFDs) > 0 {
+		process.Env = append(process.Env, "LISTEN_FDS="+strconv.Itoa(len(r.listenFDs)), "LISTEN_PID=1")
+		process.ExtraFiles = append(process.ExtraFiles, r.listenFDs...)
+	}
+	baseFd := 3 + len(process.ExtraFiles)
+	// 打开并锁定当前这个进程，防止被调度走
+	// 跑完了再关掉，重新调度
+	// 检查并保留额外的文件描述符，确保它们再容器进程中是可用的
+	procSelfFd, closer := utils.ProcThreadSelf("fd/")
+	defer closer()
+	for i := baseFd; i < baseFd+r.preserveFDs; i++ {
+		_, err = os.Stat(filepath.Join(procSelfFd, strconv.Itoa(i)))
+		if err != nil {
+			return -1, fmt.Errorf("unable to stat preserved-fd %d (of %d): %w", i-baseFd, r.preserveFDs, err)
+		}
+		process.ExtraFiles = append(process.ExtraFiles, os.NewFile(uintptr(i), "PreserveFD:"+strconv.Itoa(i)))
+	}
+	// 如果是create，或者本身r中也写了detach为true，之后可能确实会detach
+	detach := r.detach || (r.action == CT_ACT_CREATE)
+	// Setting up IO is a two stage process. We need to modify process to deal
+	// with detaching containers, and then we get a tty after the container has
+	// started.
+	// 为容器设置控制台等IO接口
+	handlerCh := newSignalHandler(r.enableSubreaper, r.notifySocket)
+	tty, err := setupIO(process, r.container, config.Terminal, detach, r.consoleSocket)
+	if err != nil {
+		return -1, err
+	}
+	defer tty.Close()
+
+	// 如果指定了pidfdocket，则调用PID文件描述符套间字，以实现和容器进程通信
+	if r.pidfdSocket != "" {
+		connClose, err := setupPidfdSocket(process, r.pidfdSocket)
+		if err != nil {
+			return -1, err
+		}
+		defer connClose()
+	}
+
+	switch r.action {
+	case CT_ACT_CREATE:
+		err = r.container.Start(process)
+	case CT_ACT_RESTORE:
+		err = r.container.Restore(process, r.criuOpts)
+	case CT_ACT_RUN:
+		err = r.container.Run(process)
+	default:
+		panic("Unknown action")
+	}
+	if err != nil {
+		return -1, err
+	}
+	// 等待控制台的初始化
+	if err = tty.waitConsole(); err != nil {
+		r.terminate(process)
+		return -1, err
+	}
+	tty.ClosePostStart()
+	// 创建PID文件路径
+	if r.pidFile != "" {
+		if err = createPidFile(r.pidFile, process); err != nil {
+			r.terminate(process)
+			return -1, err
+		}
+	}
+	// 信号量相关，负责信号转发或者直接返回
+	// 如果没啥异常，最后直接销毁runner容器
+	handler := <-handlerCh
+	status, err := handler.forward(process, tty, detach)
+	if err != nil {
+		r.terminate(process)
+	}
+	if detach {
+		return 0, nil
+	}
+	if err == nil {
+		r.destroy()
+	}
+	return status, err
+}
+```
+**涉及文件操作的看上去并不多，主要有三类**
+- 本身容器创建时对于spec文件的读取和解析
+- 容器创建时的root路径和StateDir路径
+- 一些杂七杂八的文件描述符和套间字暴露在外，用来和操作系统进行交互
+
+负责交互的这一部分资源可能需要仔细考虑，分析确认其确实不会影响容器本身。除此之外，目前我们还没跑到镜像加载和基本文件系统的加载上，只是看上去象征性的为容器提供了一个对应的文件夹来做处理。
+
+在create场景下，我们需要进一步研究函数r,container.create
+```go
+err = r.container.Start(process)
+
+// Start starts a process inside the container. Returns error if process fails
+// to start. You can track process lifecycle with passed Process structure.
+// 这边的process是configuration process在libcontainer中的影子，特别注意
+// 它并不是真正的容器进程，只不过有了容器进程的名，没有容器进程的实
+func (c *Container) Start(process *Process) error {
+	// container.mutex.lock()
+	c.m.Lock()
+	defer c.m.Unlock()
+	return c.start(process)
+}
+```
+进入到container的start函数中
+```go
+func (c *Container) start(process *Process) (retErr error) {
+	if c.config.Cgroups.Resources.SkipDevices {
+		return errors.New("can't start container with SkipDevices set")
+	}
+
+	if c.config.RootlessEUID && len(process.AdditionalGroups) > 0 {
+		// We cannot set any additional groups in a rootless container
+		// and thus we bail if the user asked us to do so.
+		return errors.New("cannot set any additional groups in a rootless container")
+	}
+	// create操作会进入这个分支
+	if process.Init {
+		if c.initProcessStartTime != 0 {
+			return errors.New("container already has init process")
+		}
+		// 在stateDir底下，创建了一个Fifo文件，设置其owner为rootuid，group为rootgid
+		// 所有者有读写权利，其他人只有读的权利
+		// FIFO为容器的初始化进程提供一个同步机制，用于协调容器的启动，比如等待容器初始化完成前，阻塞等待FIFO文件的操作
+		// 确保容器安全并且可靠地启动
+		if err := c.createExecFifo(); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil {
+				c.deleteExecFifo()
+			}
+		}()
+	}
+
+	// 核心函数，需要仔细看和分析
+	parent, err := c.newParentProcess(process)
+	if err != nil {
+		return fmt.Errorf("unable to create new parent process: %w", err)
+	}
+	// We do not need the cloned binaries once the process is spawned.
+	defer process.closeClonedExes()
+
+	logsDone := parent.forwardChildLogs()
+
+	// Before starting "runc init", mark all non-stdio open files as O_CLOEXEC
+	// to make sure we don't leak any files into "runc init". Any files to be
+	// passed to "runc init" through ExtraFiles will get dup2'd by the Go
+	// runtime and thus their O_CLOEXEC flag will be cleared. This is some
+	// additional protection against attacks like CVE-2024-21626, by making
+	// sure we never leak files to "runc init" we didn't intend to.
+	if err := utils.CloseExecFrom(3); err != nil {
+		return fmt.Errorf("unable to mark non-stdio fds as cloexec: %w", err)
+	}
+	if err := parent.start(); err != nil {
+		return fmt.Errorf("unable to start container process: %w", err)
+	}
+
+	if logsDone != nil {
+		defer func() {
+			// Wait for log forwarder to finish. This depends on
+			// runc init closing the _LIBCONTAINER_LOGPIPE log fd.
+			err := <-logsDone
+			if err != nil && retErr == nil {
+				retErr = fmt.Errorf("unable to forward init logs: %w", err)
+			}
+		}()
+	}
+
+	if process.Init {
+		c.fifo.Close()
+		if c.config.HasHook(configs.Poststart) {
+			s, err := c.currentOCIState()
+			if err != nil {
+				return err
+			}
+
+			if err := c.config.Hooks.Run(configs.Poststart, s); err != nil {
+				if err := ignoreTerminateErrors(parent.terminate()); err != nil {
+					logrus.Warn(fmt.Errorf("error running poststart hook: %w", err))
+				}
+				return err
+			}
+		}
+	}
+	return nil
+}
+```
+```go
+func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
+	// 用于同步父进程和子进程之间的数据传递
+	comm, err := newProcessComm()
+	if err != nil {
+		return nil, err
+	}
+
+	// Make sure we use a new safe copy of /proc/self/exe binary each time, this
+	// is called to make sure that if a container manages to overwrite the file,
+	// it cannot affect other containers on the system. For runc, this code will
+	// only ever be called once, but libcontainer users might call this more than
+	// once.
+	// 关闭现有的与Process相关的Exes文件，防止对于这些EXE文件的修改干扰到其他容器进程
+	p.closeClonedExes()
+	var (
+		exePath string
+		safeExe *os.File
+	)
+	// 判断是否这个exe已经被cloned了，如果是，那就不用做额外处理，不会影响到其他容器进程
+	if exeseal.IsSelfExeCloned() {
+		// /proc/self/exe is already a cloned binary -- no need to do anything
+		logrus.Debug("skipping binary cloning -- /proc/self/exe is already cloned!")
+		// We don't need to use /proc/thread-self here because the exe mm of a
+		// thread-group is guaranteed to be the same for all threads by
+		// definition. This lets us avoid having to do runtime.LockOSThread.
+		exePath = "/proc/self/exe"
+	} else {
+		var err error
+		safeExe, err = exeseal.CloneSelfExe(c.stateDir)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create safe /proc/self/exe clone for runc init: %w", err)
+		}
+		exePath = "/proc/self/fd/" + strconv.Itoa(int(safeExe.Fd()))
+		p.clonedExes = append(p.clonedExes, safeExe)
+		logrus.Debug("runc exeseal: using /proc/self/exe clone") // used for tests
+	}
+
+	cmd := exec.Command(exePath, "init")
+	cmd.Args[0] = os.Args[0]
+	cmd.Stdin = p.Stdin
+	cmd.Stdout = p.Stdout
+	cmd.Stderr = p.Stderr
+	cmd.Dir = c.config.Rootfs
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &unix.SysProcAttr{}
+	}
+	cmd.Env = append(cmd.Env, "GOMAXPROCS="+os.Getenv("GOMAXPROCS"))
+	cmd.ExtraFiles = append(cmd.ExtraFiles, p.ExtraFiles...)
+	if p.ConsoleSocket != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, p.ConsoleSocket)
+		cmd.Env = append(cmd.Env,
+			"_LIBCONTAINER_CONSOLE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
+		)
+	}
+
+	cmd.ExtraFiles = append(cmd.ExtraFiles, comm.initSockChild)
+	cmd.Env = append(cmd.Env,
+		"_LIBCONTAINER_INITPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
+	)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, comm.syncSockChild.File())
+	cmd.Env = append(cmd.Env,
+		"_LIBCONTAINER_SYNCPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
+	)
+
+	cmd.ExtraFiles = append(cmd.ExtraFiles, comm.logPipeChild)
+	cmd.Env = append(cmd.Env,
+		"_LIBCONTAINER_LOGPIPE="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
+	if p.LogLevel != "" {
+		cmd.Env = append(cmd.Env, "_LIBCONTAINER_LOGLEVEL="+p.LogLevel)
+	}
+
+	if p.PidfdSocket != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, p.PidfdSocket)
+		cmd.Env = append(cmd.Env,
+			"_LIBCONTAINER_PIDFD_SOCK="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1),
+		)
+	}
+
+	// TODO: After https://go-review.googlesource.com/c/go/+/515799 included
+	// in go versions supported by us, we can remove this logic.
+	if safeExe != nil {
+		// Due to a Go stdlib bug, we need to add safeExe to the set of
+		// ExtraFiles otherwise it is possible for the stdlib to clobber the fd
+		// during forkAndExecInChild1 and replace it with some other file that
+		// might be malicious. This is less than ideal (because the descriptor
+		// will be non-O_CLOEXEC) however we have protections in "runc init" to
+		// stop us from leaking extra file descriptors.
+		//
+		// See <https://github.com/golang/go/issues/61751>.
+		cmd.ExtraFiles = append(cmd.ExtraFiles, safeExe)
+
+		// There is a race situation when we are opening a file, if there is a
+		// small fd was closed at that time, maybe it will be reused by safeExe.
+		// Because of Go stdlib fds shuffling bug, if the fd of safeExe is too
+		// small, go stdlib will dup3 it to another fd, or dup3 a other fd to this
+		// fd, then it will cause the fd type cmd.Path refers to a random path,
+		// and it can lead to an error "permission denied" when starting the process.
+		// Please see #4294.
+		// So we should not use the original fd of safeExe, but use the fd after
+		// shuffled by Go stdlib. Because Go stdlib will guarantee this fd refers to
+		// the correct file.
+		cmd.Path = "/proc/self/fd/" + strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1)
+	}
+
+	// NOTE: when running a container with no PID namespace and the parent
+	//       process spawning the container is PID1 the pdeathsig is being
+	//       delivered to the container's init process by the kernel for some
+	//       reason even with the parent still running.
+	if c.config.ParentDeathSignal > 0 {
+		cmd.SysProcAttr.Pdeathsig = unix.Signal(c.config.ParentDeathSignal)
+	}
+
+	if p.Init {
+		// We only set up fifoFd if we're not doing a `runc exec`. The historic
+		// reason for this is that previously we would pass a dirfd that allowed
+		// for container rootfs escape (and not doing it in `runc exec` avoided
+		// that problem), but we no longer do that. However, there's no need to do
+		// this for `runc exec` so we just keep it this way to be safe.
+		if err := c.includeExecFifo(cmd); err != nil {
+			return nil, fmt.Errorf("unable to setup exec fifo: %w", err)
+		}
+		return c.newInitProcess(p, cmd, comm)
+	}
+	return c.newSetnsProcess(p, cmd, comm)
+}
+```
+
+```go
+// CloneSelfExe makes a clone of the current process's binary (through
+// /proc/self/exe). This binary can then be used for "runc init" in order to
+// make sure the container process can never resolve the original runc binary.
+// For more details on why this is necessary, see CVE-2019-5736.
+func CloneSelfExe(tmpDir string) (*os.File, error) {
+	// Try to create a temporary overlayfs to produce a readonly version of
+	// /proc/self/exe that cannot be "unwrapped" by the container. In contrast
+	// to CloneBinary, this technique does not require any extra memory usage
+	// and does not have the (fairly noticeable) performance impact of copying
+	// a large binary file into a memfd.
+	//
+	// Based on some basic performance testing, the overlayfs approach has
+	// effectively no performance overhead (it is on par with both
+	// MS_BIND+MS_RDONLY and no binary cloning at all) while memfd copying adds
+	// around ~60% overhead during container startup.
+	overlayFile, err := sealedOverlayfs("/proc/self/exe", tmpDir)
+	if err == nil {
+		logrus.Debug("runc exeseal: using overlayfs for sealed /proc/self/exe") // used for tests
+		return overlayFile, nil
+	}
+	logrus.WithError(err).Debugf("could not use overlayfs for /proc/self/exe sealing -- falling back to making a temporary copy")
+
+	selfExe, err := os.Open("/proc/self/exe")
+	if err != nil {
+		return nil, fmt.Errorf("opening current binary: %w", err)
+	}
+	defer selfExe.Close()
+
+	stat, err := selfExe.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("checking /proc/self/exe size: %w", err)
+	}
+	size := stat.Size()
+
+	return CloneBinary(selfExe, size, "/proc/self/exe", tmpDir)
+}
+
+// sealedOverlayfs will create an internal overlayfs mount using fsopen() that
+// uses the directory containing the binary as a lowerdir and a temporary tmpfs
+// as an upperdir. There is no way to "unwrap" this (unlike MS_BIND+MS_RDONLY)
+// and so we can create a safe zero-copy sealed version of /proc/self/exe.
+// This only works for privileged users and on kernels with overlayfs and
+// fsopen() enabled.
+// 
+// TODO: Since Linux 5.11, overlayfs can be created inside user namespaces so
+// it is technically possible to create an overlayfs even for rootless
+// containers. Unfortunately, this would require some ugly manual CGo+fork
+// magic so we can do this later if we feel it's really needed.
+func sealedOverlayfs(binPath, tmpDir string) (_ *os.File, Err error) {
+	// Try to do the superblock creation first to bail out early if we can't
+	// use this method.
+	// fsopen是一个特殊系统调用，用于创建文件系统的上下文
+	// overlayCtx是一个文件形式的上下文
+	overlayCtx, err := fsopen("overlay", unix.FSOPEN_CLOEXEC)
+	if err != nil {
+		return nil, err
+	}
+	defer overlayCtx.Close()
+
+	// binPath is going to be /proc/self/exe, so do a readlink to get the real
+	// path. overlayfs needs the real underlying directory for this protection
+	// mode to work properly.
+	// 得到binPath所对应的底层真实路径
+	// 分割成目录部分和文件名部分
+	if realPath, err := os.Readlink(binPath); err == nil {
+		binPath = realPath
+	}
+	binLowerDirPath, binName := filepath.Split(binPath)
+	// Escape any ":"s or "\"s in the path.
+	binLowerDirPath = escapeOverlayLowerDir(binLowerDirPath)
+
+	// Overlayfs requires two lowerdirs in order to run in "lower-only" mode,
+	// where writes are completely blocked. Ideally we would create a dummy
+	// tmpfs for this, but it turns out that overlayfs doesn't allow for
+	// anonymous mountns paths.
+	// NOTE: I'm working on a patch to fix this but it won't be backported.
+	// 临时目录用作占位符号
+	dummyLowerDirPath := escapeOverlayLowerDir(tmpDir)
+
+	// Configure the lowerdirs. The binary lowerdir needs to be on the top to
+	// ensure that a file called "runc" (binName) in the dummy lowerdir doesn't
+	// mask the binary.
+	lowerDirStr := binLowerDirPath + ":" + dummyLowerDirPath
+	// FsconfigSetString设置OverlayFS的lowerdir参数
+	// 相关的信息已经写到了overlayCtx.Fd()指向的具体的那个文件了
+	if err := unix.FsconfigSetString(int(overlayCtx.Fd()), "lowerdir", lowerDirStr); err != nil {
+		return nil, fmt.Errorf("fsconfig set overlayfs lowerdir=%s: %w", lowerDirStr, err)
+	}
+
+	// We don't care about xino (Linux 4.17) but it will be auto-enabled on
+	// some systems (if /run/runc and /usr/bin are on different filesystems)
+	// and this produces spurious dmesg log entries. We can safely ignore
+	// errors when disabling this because we don't actually care about the
+	// setting and we're just opportunistically disabling it.
+	_ = unix.FsconfigSetString(int(overlayCtx.Fd()), "xino", "off")
+
+	// Get an actual handle to the overlayfs.
+	// 把CMD做了设置，马上就创建了，需要在OverlayCtx中额外写入一部分信息
+	if err := unix.FsconfigCreate(int(overlayCtx.Fd())); err != nil {
+		return nil, os.NewSyscallError("fsconfig create overlayfs", err)
+	}
+	// 
+	overlayFd, err := fsmount(overlayCtx, unix.FSMOUNT_CLOEXEC, unix.MS_RDONLY|unix.MS_NODEV|unix.MS_NOSUID)
+	if err != nil {
+		return nil, err
+	}
+	defer overlayFd.Close()
+
+	// Grab a handle to the binary through overlayfs.
+	exeFile, err := utils.Openat(overlayFd, binName, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s from overlayfs (lowerdir=%s): %w", binName, lowerDirStr, err)
+	}
+	// NOTE: We would like to check that exeFile is the same as /proc/self/exe,
+	// except this is a little difficult. Depending on what filesystems the
+	// layers are on, overlayfs can remap the inode numbers (and it always
+	// creates its own device numbers -- see ovl_map_dev_ino) so we can't do a
+	// basic stat-based check. The only reasonable option would be to hash both
+	// files and compare them, but this would require fully reading both files
+	// which would produce a similar performance overhead to memfd cloning.
+	//
+	// Ultimately, there isn't a real attack to be worried about here. An
+	// attacker would need to be able to modify files in /usr/sbin (or wherever
+	// runc lives), at which point they could just replace the runc binary with
+	// something malicious anyway.
+	return exeFile, nil
 }
 ```
