@@ -712,6 +712,7 @@ func (r *runner) run(config *specs.Process) (int, error) {
 	// 打开并锁定当前这个进程，防止被调度走
 	// 跑完了再关掉，重新调度
 	// 检查并保留额外的文件描述符，确保它们再容器进程中是可用的
+	// ProcThreadSelf文件目录下对应的几个FDs => 以及对应的假的文件
 	procSelfFd, closer := utils.ProcThreadSelf("fd/")
 	defer closer()
 	for i := baseFd; i < baseFd+r.preserveFDs; i++ {
@@ -920,6 +921,7 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		exePath = "/proc/self/exe"
 	} else {
 		var err error
+		// 先创建overlayfs文件系统包着，保证只读，然后把路径导入到safeExe中
 		safeExe, err = exeseal.CloneSelfExe(c.stateDir)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create safe /proc/self/exe clone for runc init: %w", err)
@@ -1013,17 +1015,24 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		if err := c.includeExecFifo(cmd); err != nil {
 			return nil, fmt.Errorf("unable to setup exec fifo: %w", err)
 		}
+		// 第一个进程会进入到这个分支里头
 		return c.newInitProcess(p, cmd, comm)
 	}
 	return c.newSetnsProcess(p, cmd, comm)
 }
 ```
+newParentProcess的主要作用
+- 容器为了防止/proc/self/exe文件本身被篡改，使用CloneSelfExe事先多拷贝一份出来进行使用，确保容器进程访问的并非runc的原始二进制文件，毕竟这个文件控制着容器的启动和管理。
+- 调用newInitProcess来创建新的进程，或者调用newSetnsProcess。注意，根据我们先前的分析，目前容器中只有一个如假包换的进程（实际上是host进程套了马甲后的结果）
 
+这边似乎涉及一些容器的术语。
+- overlayfs是Linux的一个联合文件系统，允许在文件系统上创建一个只读层，被用来创建一个只读版本的exe，防止容器进程修改它
 ```go
 // CloneSelfExe makes a clone of the current process's binary (through
 // /proc/self/exe). This binary can then be used for "runc init" in order to
 // make sure the container process can never resolve the original runc binary.
 // For more details on why this is necessary, see CVE-2019-5736.
+// tmpDir就是stateDir
 func CloneSelfExe(tmpDir string) (*os.File, error) {
 	// Try to create a temporary overlayfs to produce a readonly version of
 	// /proc/self/exe that cannot be "unwrapped" by the container. In contrast
@@ -1035,11 +1044,14 @@ func CloneSelfExe(tmpDir string) (*os.File, error) {
 	// effectively no performance overhead (it is on par with both
 	// MS_BIND+MS_RDONLY and no binary cloning at all) while memfd copying adds
 	// around ~60% overhead during container startup.
+	// 保护/proc/self/exe这个exe文件，通过创建一个overlayfs文件系统，设置可读，防止exe文件被篡改
 	overlayFile, err := sealedOverlayfs("/proc/self/exe", tmpDir)
 	if err == nil {
+		// 正常情况下应该会进入这一分支
 		logrus.Debug("runc exeseal: using overlayfs for sealed /proc/self/exe") // used for tests
 		return overlayFile, nil
 	}
+	// 下面的是魔法，只要知道有这件事情就好了
 	logrus.WithError(err).Debugf("could not use overlayfs for /proc/self/exe sealing -- falling back to making a temporary copy")
 
 	selfExe, err := os.Open("/proc/self/exe")
@@ -1102,9 +1114,11 @@ func sealedOverlayfs(binPath, tmpDir string) (_ *os.File, Err error) {
 	// Configure the lowerdirs. The binary lowerdir needs to be on the top to
 	// ensure that a file called "runc" (binName) in the dummy lowerdir doesn't
 	// mask the binary.
+	// 看起来就是对exe这个文件的目录底下，开了一个tmpDir目录，作为真正的lowerdir，然后之后再保护起来
 	lowerDirStr := binLowerDirPath + ":" + dummyLowerDirPath
 	// FsconfigSetString设置OverlayFS的lowerdir参数
 	// 相关的信息已经写到了overlayCtx.Fd()指向的具体的那个文件了
+	// lowerDirStr表示只读目录的路径
 	if err := unix.FsconfigSetString(int(overlayCtx.Fd()), "lowerdir", lowerDirStr); err != nil {
 		return nil, fmt.Errorf("fsconfig set overlayfs lowerdir=%s: %w", lowerDirStr, err)
 	}
@@ -1121,7 +1135,8 @@ func sealedOverlayfs(binPath, tmpDir string) (_ *os.File, Err error) {
 	if err := unix.FsconfigCreate(int(overlayCtx.Fd())); err != nil {
 		return nil, os.NewSyscallError("fsconfig create overlayfs", err)
 	}
-	// 
+	// 把文件系统挂载到overlayCtx所示的文件位置上，并且设置了其他的类型
+	// 看起来就是只在/proc/self/exe之上建立了overlayfs类型的文件系统
 	overlayFd, err := fsmount(overlayCtx, unix.FSMOUNT_CLOEXEC, unix.MS_RDONLY|unix.MS_NODEV|unix.MS_NOSUID)
 	if err != nil {
 		return nil, err
@@ -1146,5 +1161,36 @@ func sealedOverlayfs(binPath, tmpDir string) (_ *os.File, Err error) {
 	// runc lives), at which point they could just replace the runc binary with
 	// something malicious anyway.
 	return exeFile, nil
+}
+```
+到这里确实完成了/proc/self/exe文件的克隆，接下来需要研究关键函数newInitProcess
+```go
+func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm) (*initProcess, error) {
+	cmd.Env = append(cmd.Env, "_LIBCONTAINER_INITTYPE="+string(initStandard))
+	nsMaps := make(map[configs.NamespaceType]string)
+	for _, ns := range c.config.Namespaces {
+		if ns.Path != "" {
+			nsMaps[ns.Type] = ns.Path
+		}
+	}
+	data, err := c.bootstrapData(c.config.Namespaces.CloneFlags(), nsMaps)
+	if err != nil {
+		return nil, err
+	}
+
+	init := &initProcess{
+		containerProcess: containerProcess{
+			cmd:           cmd,
+			comm:          comm,
+			manager:       c.cgroupManager,
+			config:        c.newInitConfig(p),
+			process:       p,
+			bootstrapData: data,
+			container:     c,
+		},
+		intelRdtManager: c.intelRdtManager,
+	}
+	c.initProcess = init
+	return init, nil
 }
 ```
