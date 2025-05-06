@@ -840,6 +840,8 @@ func (c *Container) start(process *Process) (retErr error) {
 	}
 
 	// 核心函数，需要仔细看和分析
+	// 总之是套壳得到了一个parent类型的process，可是，它本质上也是process的套壳，只不过是设置成了containerProcess类型
+	// 甚至目前这个对应的parent process也还只是一个配置信息，并没有真正地启动起来
 	parent, err := c.newParentProcess(process)
 	if err != nil {
 		return fmt.Errorf("unable to create new parent process: %w", err)
@@ -855,9 +857,11 @@ func (c *Container) start(process *Process) (retErr error) {
 	// runtime and thus their O_CLOEXEC flag will be cleared. This is some
 	// additional protection against attacks like CVE-2024-21626, by making
 	// sure we never leak files to "runc init" we didn't intend to.
+    // 这边主要是关闭对应的文件，似乎也不是那么重要
 	if err := utils.CloseExecFrom(3); err != nil {
 		return fmt.Errorf("unable to mark non-stdio fds as cloexec: %w", err)
 	}
+	// 这边看起来是重要的启动位置
 	if err := parent.start(); err != nil {
 		return fmt.Errorf("unable to start container process: %w", err)
 	}
@@ -873,6 +877,7 @@ func (c *Container) start(process *Process) (retErr error) {
 		}()
 	}
 
+	// 后面是额外地添加hook的过程，并不重要
 	if process.Init {
 		c.fifo.Close()
 		if c.config.HasHook(configs.Poststart) {
@@ -880,7 +885,7 @@ func (c *Container) start(process *Process) (retErr error) {
 			if err != nil {
 				return err
 			}
-
+			// 容器创建成功后，运行前跑一些任务（runc init进程已经跑起来了）
 			if err := c.config.Hooks.Run(configs.Poststart, s); err != nil {
 				if err := ignoreTerminateErrors(parent.terminate()); err != nil {
 					logrus.Warn(fmt.Errorf("error running poststart hook: %w", err))
@@ -891,8 +896,8 @@ func (c *Container) start(process *Process) (retErr error) {
 	}
 	return nil
 }
-```
-```go
+
+
 func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	// 用于同步父进程和子进程之间的数据传递
 	comm, err := newProcessComm()
@@ -1012,6 +1017,7 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 		// for container rootfs escape (and not doing it in `runc exec` avoided
 		// that problem), but we no longer do that. However, there's no need to do
 		// this for `runc exec` so we just keep it this way to be safe.
+		// 把exec.fifo也加入到ExtraFiles中
 		if err := c.includeExecFifo(cmd); err != nil {
 			return nil, fmt.Errorf("unable to setup exec fifo: %w", err)
 		}
@@ -1177,7 +1183,7 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 	if err != nil {
 		return nil, err
 	}
-
+	// 套壳，使用了如假包换的进程
 	init := &initProcess{
 		containerProcess: containerProcess{
 			cmd:           cmd,
@@ -1194,3 +1200,459 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 	return init, nil
 }
 ```
+而initProcess所对应的start函数如下所示，非常复杂，也是我们最核心需要分析的函数之一了：
+```go
+func (p *initProcess) start() (retErr error) {
+	defer p.comm.closeParent()
+	// 关键位置，启动cmd中记录的init程序，并跑起来它
+	// 具体内容我们将会在runc_init中进行分析，这边先暂且不提及
+	err := p.cmd.Start()
+	p.process.ops = p
+	// close the child-side of the pipes (controlled by child)
+	p.comm.closeChild()
+	if err != nil {
+		p.process.ops = nil
+		return fmt.Errorf("unable to start init: %w", err)
+	}
+
+	defer func() {
+		if retErr != nil {
+			// Find out if init is killed by the kernel's OOM killer.
+			// Get the count before killing init as otherwise cgroup
+			// might be removed by systemd.
+			oom, err := p.manager.OOMKillCount()
+			if err != nil {
+				logrus.WithError(err).Warn("unable to get oom kill count")
+			} else if oom > 0 {
+				// Does not matter what the particular error was,
+				// its cause is most probably OOM, so report that.
+				const oomError = "container init was OOM-killed (memory limit too low?)"
+
+				if logrus.GetLevel() >= logrus.DebugLevel {
+					// Only show the original error if debug is set,
+					// as it is not generally very useful.
+					retErr = fmt.Errorf(oomError+": %w", retErr)
+				} else {
+					retErr = errors.New(oomError)
+				}
+			}
+
+			// Terminate the process to ensure we can remove cgroups.
+			// 确保通过terminate发送SIGKILL信号终止进程，确保清理了cgroup，销毁cgroup
+			if err := ignoreTerminateErrors(p.terminate()); err != nil {
+				logrus.WithError(err).Warn("unable to terminate initProcess")
+			}
+
+			_ = p.manager.Destroy()
+			if p.intelRdtManager != nil {
+				_ = p.intelRdtManager.Destroy()
+			}
+		}
+	}()
+
+	// Do this before syncing with child so that no children can escape the
+	// cgroup. We don't need to worry about not doing this and not being root
+	// because we'd be using the rootless cgroup manager in that case.
+	// 将p.pid对应的进程，说白了就是runc init，加入到指定的cgroup中
+	if err := p.manager.Apply(p.pid()); err != nil {
+		if errors.Is(err, cgroups.ErrRootless) {
+			// ErrRootless is to be ignored except when
+			// the container doesn't have private pidns.
+			if !p.config.Config.Namespaces.IsPrivate(configs.NEWPID) {
+				// TODO: make this an error in runc 1.3.
+				logrus.Warn("Creating a rootless container with no cgroup and no private pid namespace. " +
+					"Such configuration is strongly discouraged (as it is impossible to properly kill all container's processes) " +
+					"and will result in an error in a future runc version.")
+			}
+		} else {
+			return fmt.Errorf("unable to apply cgroup configuration: %w", err)
+		}
+	}
+	if p.intelRdtManager != nil {
+		if err := p.intelRdtManager.Apply(p.pid()); err != nil {
+			return fmt.Errorf("unable to apply Intel RDT configuration: %w", err)
+		}
+	}
+	// 把bootstrapData写入到init对应的通道，runc init进程接收到会设置自身运行的namespaces数据等
+	if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
+		return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
+	}
+	// 获取子进程的PID
+	// 也就是runc init中开的子进程
+	childPid, err := p.getChildPid()
+	if err != nil {
+		return fmt.Errorf("can't get final child's PID from pipe: %w", err)
+	}
+
+	// Save the standard descriptor names before the container process
+	// can potentially move them (e.g., via dup2()).  If we don't do this now,
+	// we won't know at checkpoint time which file descriptor to look up.
+	// 获得子进程的文件描述符路径
+	fds, err := getPipeFds(childPid)
+	if err != nil {
+		return fmt.Errorf("error getting pipe fds for pid %d: %w", childPid, err)
+	}
+	p.setExternalDescriptors(fds)
+
+	// Wait for our first child to exit
+	if err := p.waitForChildExit(childPid); err != nil {
+		return fmt.Errorf("error waiting for our first child to exit: %w", err)
+	}
+
+	// Spin up a goroutine to handle remapping mount requests by runc init.
+	// There is no point doing this for rootless containers because they cannot
+	// configure MOUNT_ATTR_IDMAP, nor do OPEN_TREE_CLONE. We could just
+	// service plain-open requests for plain bind-mounts but there's no need
+	// (rootless containers will never have permission issues on a source mount
+	// that the parent process can help with -- they are the same user).
+	var mountRequest mountSourceRequestFn
+	// 启动一个goroutine，这个用户态线程，来负责处理之后的挂载请求
+	// 会通过Setns系统调用，切换到容器所对应的挂载命名空间
+	if !p.container.config.RootlessEUID {
+		request, cancel, err := p.goCreateMountSources(context.Background())
+		if err != nil {
+			return fmt.Errorf("error spawning mount remapping thread: %w", err)
+		}
+		defer cancel()
+		mountRequest = request
+	}
+
+	if err := p.createNetworkInterfaces(); err != nil {
+		return fmt.Errorf("error creating network interfaces: %w", err)
+	}
+
+	// initConfig.SpecState is only needed to run hooks that are executed
+	// inside a container, i.e. CreateContainer and StartContainer.
+	if p.config.Config.HasHook(configs.CreateContainer, configs.StartContainer) {
+		p.config.SpecState, err = p.container.currentOCIState()
+		if err != nil {
+			return fmt.Errorf("error getting current state: %w", err)
+		}
+	}
+
+	// 序列化p.config的信息，从管道处发到runc init容器
+	if err := utils.WriteJSON(p.comm.initSockParent, p.config); err != nil {
+		return fmt.Errorf("error sending config to init process: %w", err)
+	}
+
+	var seenProcReady bool
+	// 根据先前解析的序列化数据，依次解析下面的请求
+	// 一直循环到socket关闭
+	ierr := parseSync(p.comm.syncSockParent, func(sync *syncT) error {
+		switch sync.Type {
+		// 挂载类型的请求
+		case procMountPlease:
+			if mountRequest == nil {
+				return fmt.Errorf("cannot fulfil mount requests as a rootless user")
+			}
+			var m *configs.Mount
+			if sync.Arg == nil {
+				return fmt.Errorf("sync %q is missing an argument", sync.Type)
+			}
+			if err := json.Unmarshal(*sync.Arg, &m); err != nil {
+				return fmt.Errorf("sync %q passed invalid mount arg: %w", sync.Type, err)
+			}
+			mnt, err := mountRequest(m)
+			if err != nil {
+				return fmt.Errorf("failed to fulfil mount request: %w", err)
+			}
+			defer mnt.file.Close()
+
+			arg, err := json.Marshal(mnt)
+			if err != nil {
+				return fmt.Errorf("sync %q failed to marshal mountSource: %w", sync.Type, err)
+			}
+			argMsg := json.RawMessage(arg)
+			if err := doWriteSync(p.comm.syncSockParent, syncT{
+				Type: procMountFd,
+				Arg:  &argMsg,
+				File: mnt.file,
+			}); err != nil {
+				return err
+			}
+		case procSeccomp:
+			if p.config.Config.Seccomp.ListenerPath == "" {
+				return errors.New("seccomp listenerPath is not set")
+			}
+			var srcFd int
+			if sync.Arg == nil {
+				return fmt.Errorf("sync %q is missing an argument", sync.Type)
+			}
+			if err := json.Unmarshal(*sync.Arg, &srcFd); err != nil {
+				return fmt.Errorf("sync %q passed invalid fd arg: %w", sync.Type, err)
+			}
+			seccompFd, err := pidGetFd(p.pid(), srcFd)
+			if err != nil {
+				return fmt.Errorf("sync %q get fd %d from child failed: %w", sync.Type, srcFd, err)
+			}
+			defer seccompFd.Close()
+			// We have a copy, the child can keep working. We don't need to
+			// wait for the seccomp notify listener to get the fd before we
+			// permit the child to continue because the child will happily wait
+			// for the listener if it hits SCMP_ACT_NOTIFY.
+			if err := writeSync(p.comm.syncSockParent, procSeccompDone); err != nil {
+				return err
+			}
+
+			s, err := p.container.currentOCIState()
+			if err != nil {
+				return err
+			}
+
+			// initProcessStartTime hasn't been set yet.
+			s.Pid = p.cmd.Process.Pid
+			s.Status = specs.StateCreating
+			containerProcessState := &specs.ContainerProcessState{
+				Version:  specs.Version,
+				Fds:      []string{specs.SeccompFdName},
+				Pid:      s.Pid,
+				Metadata: p.config.Config.Seccomp.ListenerMetadata,
+				State:    *s,
+			}
+			if err := sendContainerProcessState(p.config.Config.Seccomp.ListenerPath,
+				containerProcessState, seccompFd); err != nil {
+				return err
+			}
+		case procReady:
+			seenProcReady = true
+			// Set rlimits, this has to be done here because we lose permissions
+			// to raise the limits once we enter a user-namespace
+			if err := setupRlimits(p.config.Rlimits, p.pid()); err != nil {
+				return fmt.Errorf("error setting rlimits for ready process: %w", err)
+			}
+
+			// generate a timestamp indicating when the container was started
+			p.container.created = time.Now().UTC()
+			p.container.state = &createdState{
+				c: p.container,
+			}
+
+			// NOTE: If the procRun state has been synced and the
+			// runc-create process has been killed for some reason,
+			// the runc-init[2:stage] process will be leaky. And
+			// the runc command also fails to parse root directory
+			// because the container doesn't have state.json.
+			//
+			// In order to cleanup the runc-init[2:stage] by
+			// runc-delete/stop, we should store the status before
+			// procRun sync.
+			state, uerr := p.container.updateState(p)
+			if uerr != nil {
+				return fmt.Errorf("unable to store init state: %w", uerr)
+			}
+			p.container.initProcessStartTime = state.InitProcessStartTime
+
+			// Sync with child.
+			if err := writeSync(p.comm.syncSockParent, procRun); err != nil {
+				return err
+			}
+		case procHooks:
+			// Setup cgroup before prestart hook, so that the prestart hook could apply cgroup permissions.
+			if err := p.manager.Set(p.config.Config.Cgroups.Resources); err != nil {
+				return fmt.Errorf("error setting cgroup config for procHooks process: %w", err)
+			}
+			if p.intelRdtManager != nil {
+				if err := p.intelRdtManager.Set(p.config.Config); err != nil {
+					return fmt.Errorf("error setting Intel RDT config for procHooks process: %w", err)
+				}
+			}
+			if p.config.Config.HasHook(configs.Prestart, configs.CreateRuntime) {
+				s, err := p.container.currentOCIState()
+				if err != nil {
+					return err
+				}
+				// initProcessStartTime hasn't been set yet.
+				s.Pid = p.cmd.Process.Pid
+				s.Status = specs.StateCreating
+				hooks := p.config.Config.Hooks
+
+				if err := hooks.Run(configs.Prestart, s); err != nil {
+					return err
+				}
+				if err := hooks.Run(configs.CreateRuntime, s); err != nil {
+					return err
+				}
+			}
+			// Sync with child.
+			if err := writeSync(p.comm.syncSockParent, procHooksDone); err != nil {
+				return err
+			}
+		default:
+			return errors.New("invalid JSON payload from child")
+		}
+		return nil
+	})
+
+	if err := p.comm.syncSockParent.Shutdown(unix.SHUT_WR); err != nil && ierr == nil {
+		return err
+	}
+	if !seenProcReady && ierr == nil {
+		ierr = errors.New("procReady not received")
+	}
+	if ierr != nil {
+		return fmt.Errorf("error during container init: %w", ierr)
+	}
+	return nil
+}
+
+// Start starts the specified command but does not wait for it to complete.
+//
+// If Start returns successfully, the c.Process field will be set.
+//
+// After a successful call to Start the [Cmd.Wait] method must be called in
+// order to release associated system resources.
+// 似乎主要是跑CMD所对应的命令，在启动的时候跑的其实就是runc init程序啦，因为cmd写了init作为参数
+func (c *Cmd) Start() error {
+	// Check for doubled Start calls before we defer failure cleanup. If the prior
+	// call to Start succeeded, we don't want to spuriously close its pipes.
+	if c.Process != nil {
+		return errors.New("exec: already started")
+	}
+
+	started := false
+	defer func() {
+		closeDescriptors(c.childIOFiles)
+		c.childIOFiles = nil
+
+		if !started {
+			closeDescriptors(c.parentIOPipes)
+			c.parentIOPipes = nil
+		}
+	}()
+
+	if c.Path == "" && c.Err == nil && c.lookPathErr == nil {
+		c.Err = errors.New("exec: no command")
+	}
+	if c.Err != nil || c.lookPathErr != nil {
+		if c.lookPathErr != nil {
+			return c.lookPathErr
+		}
+		return c.Err
+	}
+	lp := c.Path
+	if runtime.GOOS == "windows" {
+		if c.Path == c.cachedLookExtensions.in {
+			// If Command was called with an absolute path, we already resolved
+			// its extension and shouldn't need to do so again (provided c.Path
+			// wasn't set to another value between the calls to Command and Start).
+			lp = c.cachedLookExtensions.out
+		} else {
+			// If *Cmd was made without using Command at all, or if Command was
+			// called with a relative path, we had to wait until now to resolve
+			// it in case c.Dir was changed.
+			//
+			// Unfortunately, we cannot write the result back to c.Path because programs
+			// may assume that they can call Start concurrently with reading the path.
+			// (It is safe and non-racy to do so on Unix platforms, and users might not
+			// test with the race detector on all platforms;
+			// see https://go.dev/issue/62596.)
+			//
+			// So we will pass the fully resolved path to os.StartProcess, but leave
+			// c.Path as is: missing a bit of logging information seems less harmful
+			// than triggering a surprising data race, and if the user really cares
+			// about that bit of logging they can always use LookPath to resolve it.
+			var err error
+			lp, err = lookExtensions(c.Path, c.Dir)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if c.Cancel != nil && c.ctx == nil {
+		return errors.New("exec: command with a non-nil Cancel was not created with CommandContext")
+	}
+	if c.ctx != nil {
+		select {
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		default:
+		}
+	}
+
+	childFiles := make([]*os.File, 0, 3+len(c.ExtraFiles))
+	stdin, err := c.childStdin()
+	if err != nil {
+		return err
+	}
+	childFiles = append(childFiles, stdin)
+	stdout, err := c.childStdout()
+	if err != nil {
+		return err
+	}
+	childFiles = append(childFiles, stdout)
+	stderr, err := c.childStderr(stdout)
+	if err != nil {
+		return err
+	}
+	childFiles = append(childFiles, stderr)
+	childFiles = append(childFiles, c.ExtraFiles...)
+
+	env, err := c.environ()
+	if err != nil {
+		return err
+	}
+	// 跑起来一个进程，并同时设置了其所对应的一些参数
+	// go语言对于进程创建的高级封装，涉及多个系统调用
+	// 这边是跑起来init这个程序
+	// 效果就是进入c.Dir所指向的文件处，根据相关的配置跑起来这个进程
+	// lp其实就是path
+	c.Process, err = os.StartProcess(lp, c.argv(), &os.ProcAttr{
+		Dir:   c.Dir,
+		Files: childFiles,
+		Env:   env,
+		Sys:   c.SysProcAttr,
+	})
+	if err != nil {
+		return err
+	}
+	started = true
+
+	// Don't allocate the goroutineErr channel unless there are goroutines to start.
+	if len(c.goroutine) > 0 {
+		goroutineErr := make(chan error, 1)
+		c.goroutineErr = goroutineErr
+
+		type goroutineStatus struct {
+			running  int
+			firstErr error
+		}
+		statusc := make(chan goroutineStatus, 1)
+		statusc <- goroutineStatus{running: len(c.goroutine)}
+		for _, fn := range c.goroutine {
+			go func(fn func() error) {
+				err := fn()
+
+				status := <-statusc
+				if status.firstErr == nil {
+					status.firstErr = err
+				}
+				status.running--
+				if status.running == 0 {
+					goroutineErr <- status.firstErr
+				} else {
+					statusc <- status
+				}
+			}(fn)
+		}
+		c.goroutine = nil // Allow the goroutines' closures to be GC'd when they complete.
+	}
+
+	// If we have anything to do when the command's Context expires,
+	// start a goroutine to watch for cancellation.
+	//
+	// (Even if the command was created by CommandContext, a helper library may
+	// have explicitly set its Cancel field back to nil, indicating that it should
+	// be allowed to continue running after cancellation after all.)
+	if (c.Cancel != nil || c.WaitDelay != 0) && c.ctx != nil && c.ctx.Done() != nil {
+		resultc := make(chan ctxResult)
+		c.ctxResult = resultc
+		go c.watchCtx(resultc)
+	}
+
+	return nil
+}
+```
+到这边似乎算是分析完了，大体都看了一次。我们总结runc_create的作用如下
+- 阅读配置文件spec，记录到p.config中去 -> 我们学习了namespace和cgroup，以及其他OS-Level隔离机制的特性和功能
+- 跑runc create的进程通过套壳马甲，最终成功在容器中跑起来一个runc init进程，用runc init来负责初始化
+- 最后runc create会等待由runc init发来的请求，并尝试同步并且处理
