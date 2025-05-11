@@ -870,6 +870,7 @@ func (c *Container) start(process *Process) (retErr error) {
 		defer func() {
 			// Wait for log forwarder to finish. This depends on
 			// runc init closing the _LIBCONTAINER_LOGPIPE log fd.
+			// LOGPIPE对应的pipe，将会告诉父亲进程，runc init已经跑完了
 			err := <-logsDone
 			if err != nil && retErr == nil {
 				retErr = fmt.Errorf("unable to forward init logs: %w", err)
@@ -1656,3 +1657,8 @@ func (c *Cmd) Start() error {
 - 阅读配置文件spec，记录到p.config中去 -> 我们学习了namespace和cgroup，以及其他OS-Level隔离机制的特性和功能
 - 跑runc create的进程通过套壳马甲，最终成功在容器中跑起来一个runc init进程，用runc init来负责初始化
 - 最后runc create会等待由runc init发来的请求，并尝试同步并且处理
+
+在完成了runc create后，我们很自然地会想去探索一下runc init做了什么
+
+## 其他
+主要参考内容：https://juejin.cn/post/6903527508784873485，用来帮助整体把控runc的代码框架
