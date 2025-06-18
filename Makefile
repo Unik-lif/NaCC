@@ -60,9 +60,9 @@ tools:
 	else \
 		mkdir -p $(TOOLCHAIN_WRKDIR) && \
 		(cd $(TOOLCHAIN_DIR) && \
-		make clean && \
 		./configure --prefix=$(abspath $(TOOLCHAIN_WRKDIR)) && \
-		make linux -j $$(nproc)) ; \
+		make linux -j $$(nproc) &&\
+		make -j $$(nproc)) ; \
 	fi
 	@echo "\033[0;32mToolchain installed to $(TOOLCHAIN_WRKDIR)\033[0m"; \
 	
