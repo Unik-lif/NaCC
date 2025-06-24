@@ -23,6 +23,9 @@ LINUX_SRCDIR := linux
 LINUX_WRKDIR := riscv-linux
 LINUX_MODULES := riscv-linux-modules
 
+AGENT_SRCDIR := agent
+
+
 OPENSBI_SRCDIR := opensbi
 
 
@@ -123,6 +126,20 @@ linux-modules: tools
 	gzip kernel-modules.tar)
 	@mv $(LINUX_MODULES)/lib/modules/kernel-modules.tar.gz .
 
+.PHONY: agent
+agent: tools
+	@echo "\033[0;33mBuilding Agent...\033[0m"
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- clean
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- all
+	@echo "\033[0;32mAgent built successfully\033[0m"
+
+.PHONY: final-image
+final-image: 
+	@echo "\033[0;33mBuilding final image...\033[0m"
+	@rm -f final_image.bin
+	@python3 pack_final_image.py $(abspath $(LINUX_WRKDIR)/arch/riscv/boot/Image) $(abspath $(AGENT_SRCDIR))/agent.bin final_image.bin
+	@chmod +x final_image.bin
+	@echo "\033[0;32mFinal image created at root directory\033[0m"
 
 .PHONY: opensbi
 opensbi: tools
@@ -187,14 +204,37 @@ launch:
 		-cpu rv64,sv39=on \
 		-smp 4 \
 		-nographic \
-		-m 16G \
+		-m 5G \
 		-bios $(abspath $(OPENSBI_SRCDIR))/build/platform/generic/firmware/fw_jump.bin \
-		-kernel $(LINUX_WRKDIR)/arch/riscv/boot/Image \
-		-append "root=/dev/vda1 rw console=ttyS0" \
+		-kernel final_image.bin \
+		-append "root=/dev/vda1 rw console=ttyS0 mem=4G" \
 		-drive file=$(DISK).qcow2,format=qcow2,id=hd0,if=none \
 		-device virtio-blk-device,drive=hd0 \
 		-netdev user,id=net0,hostfwd=tcp::2222-:22 \
 		-device virtio-net-device,netdev=net0 \
+		$$DEBUG_OPTS
+
+
+# agent-test is used to test the agent in the QEMU environment
+# the agent.bin will start at the 0x80200000 like linux
+# but in general agent.bin will be attached with the linux kernel
+#
+# Please make sure we've changed the agent.bin to the correct address
+.PHONY: agent-test
+agent-test:
+	@echo "\033[0;33mLaunching QEMU...\033[0m"
+	@if [ "$(DEBUG)" = "1" ]; then \
+		DEBUG_OPTS="-S -s"; \
+	else \
+		DEBUG_OPTS=""; \
+	fi; \
+	$(QEMU_WRKDIR)/bin/qemu-system-riscv64 \
+		-machine virt \
+		-cpu rv64,sv39=on \
+		-nographic \
+		-m 8G \
+		-bios $(abspath $(OPENSBI_SRCDIR))/build/platform/generic/firmware/fw_jump.bin \
+		-kernel $(abspath $(AGENT_SRCDIR))/agent.bin \
 		$$DEBUG_OPTS
 
 
@@ -209,9 +249,11 @@ gdb:
 vm:
 	ssh -p 2222 root@localhost -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 
+
 .PHONY: dump
 dump:
 	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-objdump -d $(LINUX_WRKDIR)/vmlinux > kernel_dump.txt
+
 
 .PHONY: shallow-clean
 shallow-clean: 
