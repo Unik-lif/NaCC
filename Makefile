@@ -73,9 +73,10 @@ tools:
 # qemu will run in the host environment, so qemu will not depend on the tools, but the linux will
 .PHONY: qemu
 qemu: 
-	echo "\033[0;33mBuilding QEMU...\033[0m"
+	@echo "\033[0;33mBuilding QEMU...\033[0m"
+	@rm -rf $(QEMU_WRKDIR)
+	@mkdir -p $(QEMU_WRKDIR)
 	@(cd $(QEMU_SRCDIR) && \
-	make clean && \
 	./configure --target-list=riscv64-softmmu,riscv64-linux-user --enable-debug --prefix=$(abspath $(QEMU_WRKDIR)) && \
 	make -j $$(nproc) && \
 	make install && \
@@ -83,7 +84,7 @@ qemu:
 
 
 .PHONY: linux-menuconfig
-linux-menuconfig: tools
+linux-menuconfig: 
 # First get menuconfig .config
 	@echo "\033[0;33mConfiguring Linux kernel...\033[0m"
 	@rm -rf $(LINUX_WRKDIR)
@@ -103,7 +104,7 @@ kernel_switch:
 	$(MAKE) launch
 
 .PHONY: linux
-linux: tools
+linux: 
 	@echo "\033[0;33mBuilding Linux kernel...\033[0m"
 	@rm -rf $(LINUX_WRKDIR)
 	@mkdir -p $(LINUX_WRKDIR)
@@ -115,7 +116,7 @@ linux: tools
 
 
 .PHONY: linux-modules
-linux-modules: tools
+linux-modules: 
 	@rm -rf $(LINUX_MODULES)
 	@rm -rf kernel-modules.tar.gz
 	@mkdir -p $(LINUX_MODULES)
@@ -126,12 +127,22 @@ linux-modules: tools
 	gzip kernel-modules.tar)
 	@mv $(LINUX_MODULES)/lib/modules/kernel-modules.tar.gz .
 
+
+.PHONY: linux-update
+linux-update: linux linux-modules modules-update final-image
+
+
 .PHONY: agent
-agent: tools
+agent: 
 	@echo "\033[0;33mBuilding Agent...\033[0m"
 	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- clean
 	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- all
 	@echo "\033[0;32mAgent built successfully\033[0m"
+
+
+.PHONY: agent-update
+agent-update: agent final-image
+
 
 .PHONY: final-image
 final-image: 
@@ -182,6 +193,7 @@ rootfs:
 
 .PHONY: modules-update
 modules-update:
+	@sudo modprobe nbd max_part=16
 	@sudo $(QEMU_WRKDIR)/bin/qemu-nbd -c /dev/nbd0 $(DISK).qcow2
 	@sudo mount /dev/nbd0p1 rootfs
 	@sudo rm -rf rootfs/lib/modules
