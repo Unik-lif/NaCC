@@ -3,6 +3,10 @@
 # It includes the necessary sub-makefiles for different components
 # SPDX-License-Identifier: Apache-2.0
 
+
+# For Linux Debug
+#  make ARCH=riscv O=/home/link/Desktop/NaCC/riscv-linux CROSS_COMPILE=/home/link/Desktop/NaCC/riscv-tools/bin/riscv64-unknown-linux-gnu- -j128
+
 CONFIGS := config
 
 # RISCV Toolchain should be installed and available
@@ -219,7 +223,7 @@ launch:
 		-m 5G \
 		-bios $(abspath $(OPENSBI_SRCDIR))/build/platform/generic/firmware/fw_jump.bin \
 		-kernel final_image.bin \
-		-append "root=/dev/vda1 rw console=ttyS0 mem=4G" \
+		-append "root=/dev/vda1 rw console=ttyS0 memmap=1G\$$0x180000000" \
 		-drive file=$(DISK).qcow2,format=qcow2,id=hd0,if=none \
 		-device virtio-blk-device,drive=hd0 \
 		-netdev user,id=net0,hostfwd=tcp::2222-:22 \
