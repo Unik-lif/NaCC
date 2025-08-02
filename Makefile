@@ -22,6 +22,7 @@ QEMU_WRKDIR := riscv-qemu
 
 QEMU_PLATFORM := generic
 
+QEMU_DEMO := qemu-demo
 
 LINUX_SRCDIR := linux
 LINUX_WRKDIR := riscv-linux
@@ -117,6 +118,8 @@ linux:
 	@cp $(CONFIGS)/linux_config $(LINUX_WRKDIR)/.config
 	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- olddefconfig
 	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- -j $$(nproc)
+	@(cd $(LINUX_SRCDIR) && \
+	python scripts/clang-tools/gen_compile_commands.py -d $(abspath $(LINUX_WRKDIR)) -o compile_commands.json)
 
 
 .PHONY: linux-modules
@@ -135,12 +138,15 @@ linux-modules:
 .PHONY: linux-update
 linux-update: linux linux-modules modules-update final-image
 
+.PHONY: agent-update
+agent-update: agent final-image
 
 .PHONY: agent
 agent: 
 	@echo "\033[0;33mBuilding Agent...\033[0m"
 	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- clean
 	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- all
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- objdump
 	@echo "\033[0;32mAgent built successfully\033[0m"
 
 
@@ -157,10 +163,11 @@ final-image:
 	@echo "\033[0;32mFinal image created at root directory\033[0m"
 
 .PHONY: opensbi
-opensbi: tools
+opensbi: 
 	@echo "\033[0;33mBuilding OpenSBI...\033[0m"
 	@make -C $(abspath $(OPENSBI_SRCDIR)) clean
-	@make -C $(abspath $(OPENSBI_SRCDIR)) PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc)
+	@(cd $(OPENSBI_SRCDIR) && \
+	bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc))
 	
 
 
@@ -215,7 +222,7 @@ launch:
 	else \
 		DEBUG_OPTS=""; \
 	fi; \
-	$(QEMU_WRKDIR)/bin/qemu-system-riscv64 \
+	gdb --args $(QEMU_WRKDIR)/bin/qemu-system-riscv64 \
 		-machine virt \
 		-cpu rv64,sv39=on \
 		-smp 4 \
@@ -230,6 +237,22 @@ launch:
 		-device virtio-net-device,netdev=net0 \
 		$$DEBUG_OPTS
 
+
+
+.PHONY: debug-qemu
+debug-qemu:
+	@echo "\033[0;33mDebugging QEMU...\033[0m"
+	@(cd $(QEMU_DEMO) && \
+	make clean && \
+	make)
+	@gdb --args $(QEMU_WRKDIR)/bin/qemu-system-riscv64 \
+		-machine virt \
+		-cpu rv64,sv39=on \
+		-nographic \
+		-bios clear_opensbi/build/platform/generic/firmware/fw_jump.bin \
+		-kernel qemu-demo/$(TEST) \
+		-d in_asm,op,exec,op_opt -D log.txt \
+		
 
 # agent-test is used to test the agent in the QEMU environment
 # the agent.bin will start at the 0x80200000 like linux
@@ -253,6 +276,11 @@ agent-test:
 		-kernel $(abspath $(AGENT_SRCDIR))/agent.bin \
 		$$DEBUG_OPTS
 
+
+.PHONY: debug-qemu-gdb
+debug-qemu-gdb:
+	@echo "\033[0;33mLaunching GDB...\033[0m"
+	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-gdb -x $(CONFIGS)/a.gdbinit
 
 .PHONY: gdb
 gdb:
