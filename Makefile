@@ -5,7 +5,7 @@
 
 
 # For Linux Debug
-#  make ARCH=riscv O=/home/link/Desktop/NaCC/riscv-linux CROSS_COMPILE=/home/link/Desktop/NaCC/riscv-tools/bin/riscv64-unknown-linux-gnu- -j128
+#  make ARCH=riscv O=/home/link/NaCC/riscv-linux CROSS_COMPILE=/home/link/NaCC/riscv-tools/bin/riscv64-unknown-linux-gnu- -j128
 
 CONFIGS := config
 
@@ -63,6 +63,8 @@ tools:
 		git submodule update --init --recursive); \
 	fi
 
+	@sudo apt-get install autoconf automake autotools-dev curl python3 python3-pip python3-tomli libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex texinfo gperf libtool patchutils bc zlib1g-dev libexpat-dev ninja-build git cmake libglib2.0-dev libslirp-dev sshpass
+	
 	@if [ -d "$(TOOLCHAIN_WRKDIR)/bin" ]; then \
 		echo "Toolchain already installed at $(abspath $(TOOLCHAIN_WRKDIR)), skipping build"; \
 	else \
@@ -70,7 +72,7 @@ tools:
 		(cd $(TOOLCHAIN_DIR) && \
 		make clean && \
 		./configure --prefix=$(abspath $(TOOLCHAIN_WRKDIR)) && \
-		make linux -j $$(nproc)) ; \
+		make && make linux -j $$(nproc)) ; \
 	fi
 	@echo "\033[0;32mToolchain installed to $(TOOLCHAIN_WRKDIR)\033[0m"; \
 	
@@ -82,9 +84,11 @@ qemu:
 	@rm -rf $(QEMU_WRKDIR)
 	@mkdir -p $(QEMU_WRKDIR)
 	@(cd $(QEMU_SRCDIR) && \
+	rm compile_commands.json || true && \
 	./configure --target-list=riscv64-softmmu,riscv64-linux-user --enable-debug --prefix=$(abspath $(QEMU_WRKDIR)) && \
 	make -j $$(nproc) && \
 	make install && \
+	cp build/compile_commands.json compile_commands.json && \
 	echo "\033[0;32mQEMU built successfully to $(QEMU_WRKDIR)\033[0m")
 
 
@@ -136,7 +140,7 @@ linux-modules:
 
 
 .PHONY: linux-update
-linux-update: linux linux-modules modules-update final-image
+linux-update: linux linux-modules modules-update final-image dump
 
 .PHONY: agent-update
 agent-update: agent final-image
@@ -151,7 +155,7 @@ agent:
 
 
 .PHONY: agent-update
-agent-update: agent final-image
+agent-update: agent final-image dump-agent
 
 
 .PHONY: final-image
@@ -168,7 +172,7 @@ opensbi:
 	@make -C $(abspath $(OPENSBI_SRCDIR)) clean
 	@(cd $(OPENSBI_SRCDIR) && \
 	bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc))
-	
+	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-objdump -d $(OPENSBI_SRCDIR)/build/platform/generic/firmware/fw_jump.elf > opensbi.asm
 
 
 # Guidance from https://github.com/carlosedp/riscv-bringup/tree/master/Qemu
@@ -222,15 +226,20 @@ launch:
 	else \
 		DEBUG_OPTS=""; \
 	fi; \
-	gdb --args $(QEMU_WRKDIR)/bin/qemu-system-riscv64 \
+	if [ "$(QEMU_GDB)" = "1" ]; then \
+		GDB_CMD="gdb --args"; \
+	else \
+		GDB_CMD=""; \
+	fi; \
+	$$GDB_CMD $(QEMU_WRKDIR)/bin/qemu-system-riscv64 \
 		-machine virt \
 		-cpu rv64,sv39=on \
-		-smp 4 \
+		-smp 1 \
 		-nographic \
 		-m 5G \
 		-bios $(abspath $(OPENSBI_SRCDIR))/build/platform/generic/firmware/fw_jump.bin \
 		-kernel final_image.bin \
-		-append "root=/dev/vda1 rw console=ttyS0 memmap=1G\$$0x180000000" \
+		-append "root=/dev/vda1 rw console=ttyS0 memmap=1025M\$$0x17ff00000, " \
 		-drive file=$(DISK).qcow2,format=qcow2,id=hd0,if=none \
 		-device virtio-blk-device,drive=hd0 \
 		-netdev user,id=net0,hostfwd=tcp::2222-:22 \
@@ -287,17 +296,27 @@ gdb:
 	@echo "\033[0;33mLaunching GDB...\033[0m"
 	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-gdb -x $(CONFIGS)/.gdbinit
 
-
 # SSH Link to the RISCV-VM
 .PHONY: vm
 vm:
-	ssh -p 2222 root@localhost -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+	@chmod +x config/vm_link.sh
+	@./config/vm_link.sh
+
+.PHONY: debug
+debug:
+	@chmod +x config/tmux-debug.sh
+	@./config/tmux-debug.sh
 
 
 .PHONY: dump
 dump:
-	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-objdump -d $(LINUX_WRKDIR)/vmlinux > kernel_dump.txt
+	@rm -rf vmlinux.asm
+	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-objdump -d $(LINUX_WRKDIR)/vmlinux > vmlinux.asm
 
+.PHONY: dump-agent
+dump-agent:
+	@rm -rf agent.asm
+	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-elf-objdump -d $(AGENT_SRCDIR)/agent.elf > agent.asm
 
 .PHONY: shallow-clean
 shallow-clean: 
