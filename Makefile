@@ -10,7 +10,7 @@
 CONFIGS := config
 
 # RISCV Toolchain should be installed and available
-TOOLCHAIN_GITHUB_REPO := https://github.com/riscv-collab/riscv-gnu-toolchain.git
+TOOLCHAIN_GITHUB_REPO := git@github.com:riscv-collab/riscv-gnu-toolchain.git 
 TOOLCHAIN_DIR := riscv-gnu-toolchain
 TOOLCHAIN_BRANCH := 2025.05.30
 TOOLCHAIN_WRKDIR := riscv-tools
@@ -29,6 +29,11 @@ LINUX_WRKDIR := riscv-linux
 LINUX_MODULES := riscv-linux-modules
 
 AGENT_SRCDIR := agent
+
+# Kernel release string used for naming (override via: make rootfs-setup version=...)
+version ?= $(shell cat $(LINUX_WRKDIR)/include/config/kernel.release 2>/dev/null || \
+  make -s -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) ARCH=riscv kernelrelease 2>/dev/null || \
+  echo unknown)
 
 
 OPENSBI_SRCDIR := opensbi
@@ -194,10 +199,36 @@ disk: tools
 	@echo "\033[0;32mDisk image created at disk/disk.qcow2\033[0m"
 
 
+.PHONY: rootfs-setup
+rootfs-setup: disk
+	@sudo tar vxf Ubuntu-Jammy-rootfs.tar.gz -C rootfs
+	@sudo mkdir -p rootfs/lib/modules
+	@sudo tar zxvf kernel-modules.tar.gz -C rootfs/lib/modules
+	@sudo mkdir -p rootfs/boot/extlinux
+	@sudo cp $(LINUX_WRKDIR)/arch/riscv/boot/Image rootfs/boot/vmlinuz-$(version)
+	@printf '%b' \
+		"menu title RISC-V Qemu Boot Options\n" \
+		"timeout 100\n" \
+		"default kernel-$(version)\n\n" \
+		"label kernel-$(version)\n" \
+		"\tmenu label Linux kernel-$(version)\n" \
+		"\tkernel /boot/vmlinuz-$(version)\n" \
+		"\tinitrd /boot/initrd.img-$(version)\n" \
+		"\tappend earlyprintk rw root=/dev/vda1 rootwait rootfstype=ext4 LANG=en_US.UTF-8 console=ttyS0\n\n" \
+		"label rescue-kernel-$(version)\n" \
+		"\tmenu label Linux kernel-$(version) (recovery mode)\n" \
+		"\tkernel /boot/vmlinuz-$(version)\n" \
+		"\tinitrd /boot/initrd.img-$(version)\n" \
+		"\tappend earlyprintk rw root=/dev/vda1 rootwait rootfstype=ext4 LANG=en_US.UTF-8 console=ttyS0 single\n" \
+	| sudo tee rootfs/boot/extlinux/extlinux.conf >/dev/null
+	@sudo chroot rootfs update-initramfs -k all -c
+	@sudo umount rootfs
+	@sudo $(QEMU_WRKDIR)/bin/qemu-nbd -d /dev/nbd0
+
 # The TarBall here won't be changed by modifying the linux configuration
 # In fact the linux modification typically will not be reflected in the kernel modules 
 .PHONY: rootfs
-rootfs:
+rootfs: disk
 	@echo "\033[0;33mBuild Ubuntu rootfs...\033[0m"
 	@sudo tar vxf $(TARBALL) -C rootfs
 	@sudo mkdir -p rootfs/lib/modules
@@ -208,8 +239,11 @@ rootfs:
 
 .PHONY: modules-update
 modules-update:
+	@sudo umount rootfs 2>/dev/null || true
+	@sudo $(QEMU_WRKDIR)/bin/qemu-nbd -d /dev/nbd0 2>/dev/null || true
 	@sudo modprobe nbd max_part=16
 	@sudo $(QEMU_WRKDIR)/bin/qemu-nbd -c /dev/nbd0 $(DISK).qcow2
+	@sleep 2
 	@sudo mount /dev/nbd0p1 rootfs
 	@sudo rm -rf rootfs/lib/modules
 	@sudo mkdir -p rootfs/lib/modules
