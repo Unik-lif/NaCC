@@ -12,7 +12,7 @@ trap cleanup EXIT
 # You can set this via argument: ./vm_link.sh "command"
 # Or uncomment below to set a default:
 # AUTO_CMD="docker run --security-opt seccomp=unconfined --rm busybox echo test"
-AUTO_CMD="docker run --security-opt seccomp=unconfined --rm busybox echo test"
+AUTO_CMD="docker run --security-opt seccomp=unconfined --rm busybox sh -c \"echo hello > /tmp/test.txt && cat /tmp/test.txt\""
 
 # 1. Start tmux logging if we are in a tmux pane
 if [ -n "$TMUX_PANE" ]; then
@@ -50,8 +50,10 @@ while true; do
     # Prepare SSH command options
     # If AUTO_CMD is set, we use -t to force PTY and chain 'exec bash -l' to keep the session open
     if [ -n "$AUTO_CMD" ]; then
+        echo -e "\033[0;36m[NaCC] Auto-running: $AUTO_CMD\033[0m"
         SSH_OPTS="-t -p 2222 root@localhost -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -- $AUTO_CMD; exec bash -l"
     else
+        echo -e "\033[0;36m[NaCC] Interactive mode (no auto command)\033[0m"
         SSH_OPTS="-p 2222 root@localhost -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
     fi
 
