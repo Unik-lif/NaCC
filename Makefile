@@ -336,11 +336,40 @@ vm:
 	@chmod +x config/vm_link.sh
 	@./config/vm_link.sh
 
+.PHONY: vm-debug
+vm-debug:
+	sshpass -p riscv ssh -p 2222 root@localhost -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+
 .PHONY: debug
 debug:
 	@chmod +x config/tmux-debug.sh
 	@./config/tmux-debug.sh
 
+
+# Logger: capture log output from named tmux panes (set by config/tmux-debug.sh)
+# Usage: make logger          — saves QEMU + VM logs with timestamp
+#        make logger LOG=name — saves with custom name prefix
+LOG_DIR := logs
+LOG ?= nacc
+
+.PHONY: logger
+logger:
+	@mkdir -p $(LOG_DIR)
+	@TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
+	QEMU_PANE=$$(tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | grep "nacc-qemu" | head -1 | awk '{print $$1}'); \
+	VM_PANE=$$(tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | grep "nacc-vm" | head -1 | awk '{print $$1}'); \
+	if [ -z "$$QEMU_PANE" ]; then \
+		echo "\033[0;31mError: Cannot find pane 'nacc-qemu'. Did you run 'make debug' first?\033[0m"; \
+		exit 1; \
+	fi; \
+	QEMU_LOG=$(LOG_DIR)/$(LOG)_qemu_$$TIMESTAMP.log; \
+	tmux capture-pane -t "$$QEMU_PANE" -p -S - > "$$QEMU_LOG"; \
+	echo "\033[0;32mQEMU log saved to $$QEMU_LOG ($$(wc -l < "$$QEMU_LOG") lines)\033[0m"; \
+	if [ -n "$$VM_PANE" ]; then \
+		VM_LOG=$(LOG_DIR)/$(LOG)_vm_$$TIMESTAMP.log; \
+		tmux capture-pane -t "$$VM_PANE" -p -S - > "$$VM_LOG"; \
+		echo "\033[0;32mVM   log saved to $$VM_LOG ($$(wc -l < "$$VM_LOG") lines)\033[0m"; \
+	fi
 
 .PHONY: dump
 dump:
