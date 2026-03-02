@@ -163,3 +163,91 @@ Fork 时不让子进程继承 `NACC_INITED`，子进程使用标准 buddy 分配
 2. **Fork-only 测试**：编写测试程序，fork 后子进程不 execve，直接访问内存，验证 COW 语义正确
 3. **多级 fork 测试**：`docker run busybox sh -c "ls | grep foo"` —— 涉及管道，两次 fork + execve
 4. **页表 debug**：在 fork 前后调用 `pgtbl_debug()` 对比父子进程页表状态
+
+---
+
+## 相关工作对比（2026-03-02 补充）
+
+调研了两个类似的机密容器工作对 fork 的处理方式：
+
+### BlackBox（OSDI'22，Columbia University）
+
+- **机制**：使用 ARM nested page table（stage-2 页表）创建 PPAS（Protected Physical Address Space）
+- **fork 处理**：OS 正常完成 fork，CSM（Container Security Monitor）**事后验证**
+  - OS 调用 `task_clone` 通知 CSM
+  - CSM 验证子进程页表内容和父进程一致
+  - 将子进程的页表页加入 PPAS（修改 stage-2 映射）
+- **性能**：fork 开销不到原来的 **3 倍**，主要来自地址空间验证
+- **关键引用**：*"new page tables will be allocated for the child task and the CSM will ensure that they match those of the caller's and cannot be directly modified by the OS."*
+
+### RContainer（NDSS'25，CAS / Boston University）
+
+- **机制**：扩展 ARM CCA，使用 GPT（Granule Protection Table）保护内存
+- **fork 处理**：类似 BlackBox，OS 正常 fork，Mini-OS 事后验证
+  - 验证 task_struct 和地址空间完整性
+  - 修改 GPT 标记子进程页表页为受保护
+- **性能**：fork+exec 约 **10%** 额外开销
+
+### 共同特点
+
+两篇论文都**不在 fork 过程中做安全干预**，而是让 OS 正常完成 fork，事后由 monitor/CSM 验证并接管。BlackBox 用 stage-2 映射保护页表页，代价很低（改一条映射即可）；NaCC 用页表页替换机制，代价相对更高但可通过批量 SBI ecall 优化。
+
+---
+
+## 最终实施方案（2026-03-02 确定）
+
+### 阶段 1：fork+exec 支持（最小改动）
+
+**目标**：让 `sh -c "cat"` 等 fork+exec 场景跑通。
+
+**改动**：在 `arch/riscv/kernel/process.c` 的 `copy_thread()` 中清除子进程的 `nacc_flag`：
+
+```c
+p->thread.nacc_flag = 0;  // fork 时切回 normal 状态
+```
+
+**原理**：
+- fork 时子进程走标准 Linux 页表复制路径，零额外开销
+- fork 产生的临时页表在 execve 时被 `exit_mmap()` 全部丢弃
+- execve 加载新 ELF 时，现有的 NaCC 初始化逻辑（`nacc_invoke` 等）重新设置 `nacc_flag` 并启动页表替换
+
+**性能开销**：零。
+
+---
+
+### 阶段 2：纯 fork 支持（Monitor 代劳方案）
+
+**目标**：支持 fork 后不 exec 的子进程（如 nginx worker、daemon 子进程）也获得 NaCC 保护。
+
+**核心思路**：对 VM_NACC 区域，跳过 Linux 的 `copy_pte_range` 逐级复制，改为一次 SBI ecall 让 monitor 完成页表复制。
+
+**Linux 侧改动**（`copy_page_range` 或 `copy_pmd_range`）：
+
+```c
+if (src_vma->vm_flags & VM_NACC) {
+    // 方案A：跳过 PTE 复制，不管 ref_count
+    //         由 bitmap 保护兜底，代价是退出时多几次拦截检查
+    // 方案B：轻量遍历 bump ref_count + 跳过 PTE 复制
+    //         避免反复拦截的性能开销
+
+    // 一次 SBI ecall 让 monitor 处理页表复制 + COW 设置
+    sbi_ecall(SBI_EXT_NACC_FORK, parent_pgd, child_pgd, vma_start, vma_end, ...);
+    child->thread.nacc_flag = NACC_INITED;
+    return 0;
+}
+// 非 VM_NACC 区域：走标准 copy_pte_range
+```
+
+**Monitor 侧**：
+1. 已知父进程的 old 页表（真实页表）的完整内容
+2. 为子进程分配一套新的 NACC PTP 页
+3. 复制父进程的页表结构到子进程
+4. 在 old PTE 层面设置 COW 写保护（monitor 可直接操作）
+5. 建立子进程的 nacc_mappings 映射关系
+
+**ref_count 处理**：
+- 数据页受 bitmap 保护，不会被 Linux 真正释放
+- 可选择不维护 ref_count（方案 A），或轻量 bump（方案 B）
+- 方案 A 的代价是进程退出时走释放路径被 bitmap 拦截（次数有限，可接受）
+
+**性能开销**：一次 SBI ecall + monitor 端页表复制，远优于逐 PTE entry 的 ecall 方案。
