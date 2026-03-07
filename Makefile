@@ -8,6 +8,9 @@
 #  make ARCH=riscv O=/home/link/NaCC/riscv-linux CROSS_COMPILE=/home/link/NaCC/riscv-tools/bin/riscv64-unknown-linux-gnu- -j128
 
 CONFIGS := config
+SUDO ?= sudo
+ROOT_SUDO ?= sudo -n
+NACC_MODULES_UPDATE_WRAPPER ?= /usr/local/sbin/nacc-modules-update
 
 # RISCV Toolchain should be installed and available
 TOOLCHAIN_GITHUB_REPO := git@github.com:riscv-collab/riscv-gnu-toolchain.git 
@@ -145,7 +148,7 @@ linux-modules:
 
 
 .PHONY: linux-update
-linux-update: linux linux-modules modules-update final-image dump
+linux-update: linux linux-modules modules-update-wrapper final-image dump
 
 .PHONY: agent-update
 agent-update: agent final-image
@@ -239,17 +242,21 @@ rootfs: disk
 
 .PHONY: modules-update
 modules-update:
-	@sudo umount rootfs 2>/dev/null || true
-	@sudo $(QEMU_WRKDIR)/bin/qemu-nbd -d /dev/nbd0 2>/dev/null || true
-	@sudo modprobe nbd max_part=16
-	@sudo $(QEMU_WRKDIR)/bin/qemu-nbd -c /dev/nbd0 $(DISK).qcow2
+	@$(SUDO) umount rootfs 2>/dev/null || true
+	@$(SUDO) $(QEMU_WRKDIR)/bin/qemu-nbd -d /dev/nbd0 2>/dev/null || true
+	@$(SUDO) modprobe nbd max_part=16
+	@$(SUDO) $(QEMU_WRKDIR)/bin/qemu-nbd -c /dev/nbd0 $(DISK).qcow2
 	@sleep 2
-	@sudo mount /dev/nbd0p1 rootfs
-	@sudo rm -rf rootfs/lib/modules
-	@sudo mkdir -p rootfs/lib/modules
-	@sudo tar zxvf kernel-modules.tar.gz -C rootfs/lib/modules
-	@sudo umount rootfs
-	@sudo $(QEMU_WRKDIR)/bin/qemu-nbd -d /dev/nbd0
+	@$(SUDO) mount /dev/nbd0p1 rootfs
+	@$(SUDO) rm -rf rootfs/lib/modules
+	@$(SUDO) mkdir -p rootfs/lib/modules
+	@$(SUDO) tar zxvf kernel-modules.tar.gz -C rootfs/lib/modules
+	@$(SUDO) umount rootfs
+	@$(SUDO) $(QEMU_WRKDIR)/bin/qemu-nbd -d /dev/nbd0
+
+.PHONY: modules-update-wrapper
+modules-update-wrapper:
+	@$(ROOT_SUDO) $(NACC_MODULES_UPDATE_WRAPPER)
 
 
 .PHONY: launch
