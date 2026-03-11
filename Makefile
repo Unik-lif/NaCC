@@ -151,7 +151,7 @@ linux-modules:
 linux-update: linux linux-modules modules-update-wrapper final-image dump
 
 .PHONY: agent-update
-agent-update: agent final-image
+agent-update: agent final-image dump-agent
 
 .PHONY: agent
 agent: 
@@ -161,9 +161,6 @@ agent:
 	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- objdump
 	@echo "\033[0;32mAgent built successfully\033[0m"
 
-
-.PHONY: agent-update
-agent-update: agent final-image dump-agent
 
 
 .PHONY: final-image
@@ -179,8 +176,20 @@ opensbi:
 	@echo "\033[0;33mBuilding OpenSBI...\033[0m"
 	@make -C $(abspath $(OPENSBI_SRCDIR)) clean
 	@(cd $(OPENSBI_SRCDIR) && \
-	bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc))
+	if command -v bear >/dev/null 2>&1; then \
+		echo "Using bear to capture OpenSBI compile_commands..."; \
+		if bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); then \
+			echo "OpenSBI build with bear completed."; \
+		else \
+			echo "bear failed, falling back to plain make for OpenSBI build..."; \
+			make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); \
+		fi; \
+	else \
+		echo "bear not found, using plain make for OpenSBI build..."; \
+		make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); \
+	fi)
 	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-objdump -d $(OPENSBI_SRCDIR)/build/platform/generic/firmware/fw_jump.elf > opensbi.asm
+	@echo "\033[0;32mOpenSBI build finished\033[0m"
 
 
 # Guidance from https://github.com/carlosedp/riscv-bringup/tree/master/Qemu
@@ -262,6 +271,10 @@ modules-update-wrapper:
 .PHONY: launch
 launch:
 	@echo "\033[0;33mLaunching QEMU...\033[0m"
+	@if [ -n "$$TMUX_PANE" ]; then \
+		tmux clear-history -t "$$TMUX_PANE" 2>/dev/null || true; \
+	fi
+	@printf '[NaCC][qemu-run-start] %s\n' "$$(date +%Y%m%d_%H%M%S)"
 	@if [ "$(DEBUG)" = "1" ]; then \
 		DEBUG_OPTS="-S -s"; \
 	else \
@@ -363,18 +376,51 @@ LOG ?= nacc
 logger:
 	@mkdir -p $(LOG_DIR)
 	@TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
-	QEMU_PANE=$$(tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | grep "nacc-qemu" | head -1 | awk '{print $$1}'); \
-	VM_PANE=$$(tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | grep "nacc-vm" | head -1 | awk '{print $$1}'); \
+	CURRENT_WINDOW=$$(tmux display-message -p "#{window_id}" 2>/dev/null || true); \
+	CURRENT_SESSION=$$(tmux display-message -p "#{session_id}" 2>/dev/null || true); \
+	QEMU_PANE=$$(tmux list-panes -t "$$CURRENT_WINDOW" -F "#{pane_id} #{pane_title}" 2>/dev/null | awk '$$2 == "nacc-qemu" { print $$1; exit }'); \
+	VM_PANE=$$(tmux list-panes -t "$$CURRENT_WINDOW" -F "#{pane_id} #{pane_title}" 2>/dev/null | awk '$$2 == "nacc-vm" { print $$1; exit }'); \
+	if [ -z "$$QEMU_PANE" ]; then \
+		QEMU_PANE=$$(tmux list-panes -t "$$CURRENT_SESSION" -F "#{pane_id} #{pane_title}" 2>/dev/null | awk '$$2 == "nacc-qemu" { print $$1; exit }'); \
+	fi; \
+	if [ -z "$$VM_PANE" ]; then \
+		VM_PANE=$$(tmux list-panes -t "$$CURRENT_SESSION" -F "#{pane_id} #{pane_title}" 2>/dev/null | awk '$$2 == "nacc-vm" { print $$1; exit }'); \
+	fi; \
+	if [ -z "$$QEMU_PANE" ]; then \
+		QEMU_PANE=$$(tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | awk '$$2 == "nacc-qemu" { print $$1; exit }'); \
+	fi; \
+	if [ -z "$$VM_PANE" ]; then \
+		VM_PANE=$$(tmux list-panes -a -F "#{pane_id} #{pane_title}" 2>/dev/null | awk '$$2 == "nacc-vm" { print $$1; exit }'); \
+	fi; \
 	if [ -z "$$QEMU_PANE" ]; then \
 		echo "\033[0;31mError: Cannot find pane 'nacc-qemu'. Did you run 'make debug' first?\033[0m"; \
 		exit 1; \
 	fi; \
 	QEMU_LOG=$(LOG_DIR)/$(LOG)_qemu_$$TIMESTAMP.log; \
-	tmux capture-pane -t "$$QEMU_PANE" -p -S - > "$$QEMU_LOG"; \
+	QEMU_TMP=$$(mktemp); \
+	tmux capture-pane -t "$$QEMU_PANE" -J -p -S - > "$$QEMU_TMP"; \
+	QEMU_START=$$(grep -n '\[NaCC\]\[qemu-run-start\]' "$$QEMU_TMP" | tail -1 | cut -d: -f1); \
+	if [ -n "$$QEMU_START" ]; then \
+		tail -n +"$$QEMU_START" "$$QEMU_TMP" > "$$QEMU_LOG"; \
+	else \
+		cp "$$QEMU_TMP" "$$QEMU_LOG"; \
+	fi; \
+	rm -f "$$QEMU_TMP"; \
 	echo "\033[0;32mQEMU log saved to $$QEMU_LOG ($$(wc -l < "$$QEMU_LOG") lines)\033[0m"; \
 	if [ -n "$$VM_PANE" ]; then \
 		VM_LOG=$(LOG_DIR)/$(LOG)_vm_$$TIMESTAMP.log; \
-		tmux capture-pane -t "$$VM_PANE" -p -S - > "$$VM_LOG"; \
+		VM_TMP=$$(mktemp); \
+		tmux capture-pane -t "$$VM_PANE" -J -p -S - > "$$VM_TMP"; \
+		VM_START=$$(grep -n '\[NaCC\]\[vm-run-start\]' "$$VM_TMP" | tail -1 | cut -d: -f1); \
+		if [ -z "$$VM_START" ]; then \
+			VM_START=$$(grep -n '\[NaCC\] Auto-running:' "$$VM_TMP" | tail -1 | cut -d: -f1); \
+		fi; \
+		if [ -n "$$VM_START" ]; then \
+			tail -n +"$$VM_START" "$$VM_TMP" > "$$VM_LOG"; \
+		else \
+			cp "$$VM_TMP" "$$VM_LOG"; \
+		fi; \
+		rm -f "$$VM_TMP"; \
 		echo "\033[0;32mVM   log saved to $$VM_LOG ($$(wc -l < "$$VM_LOG") lines)\033[0m"; \
 	fi
 
