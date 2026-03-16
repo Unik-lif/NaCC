@@ -2,6 +2,14 @@
 
 这份文档是把 `AGENT.md` 与 `.agent/` 中可复用信息，整理成当前仓库的实用协作手册，便于后续快速迭代。
 
+会话切换时请先看：
+
+- `docs/agent/SESSION_BOOTSTRAP.md`
+- `docs/agent/NACC_KNOWLEDGE_BASE.md`（长期稳定结论）
+- `docs/agent/BITTER_LESSONS.md`（高代价反例，先避免重复踩坑）
+- `docs/agent/REEXEC_DEBUG_20260312.md`（3 月 12 日这轮 same-PID `reexec` 收敛结果）
+- `docs/agent/FORK_DEBUG_20260315.md`（3 月 15 日这轮 fork+exec 主线收敛结果）
+
 ## 1. 项目事实（长期有效）
 
 - 核心代码目录：
@@ -77,6 +85,8 @@
 
 - 把每次 crash 根因和修复动作沉淀到 `record/*.md`，避免同类回归重复分析。
 - 若 fork/exec 路径再次变更，优先更新本目录文档，再改实现。
+- 长期稳定结论优先写入 `docs/agent/NACC_KNOWLEDGE_BASE.md`，避免只留在临时记录里。
+- 高代价误判、错日志、错回滚这类反例，优先写入 `docs/agent/BITTER_LESSONS.md`。
 
 ## 5. Git 协作约定（当前）
 
