@@ -32,6 +32,7 @@
   - `AGENT_CODER.md`
   - `AGENT_LOG_ANALYZER.md`
   - `AGENT_PAPER_SCOUT.md`
+  - `AGENT_TEST_RUNNER.md`
 - 需要 guardrail：
   - `WORKFLOW_GUARDRAILS.md`
   - `HUMAN_OPERATOR_CHECKLIST.md`

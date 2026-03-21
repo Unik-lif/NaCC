@@ -20,6 +20,26 @@
 
 ## Current Entries
 
+### [2026-03-18] fork 长期方向转向 Linux 原生路径 + OpenSBI 写辅助
+
+- Status: accepted
+- Decision: 不再把当前的 `raw page-table copy + 长期零散补洞` 视为 fork 最终模型；长期方向改为“Linux 尽量走原生 fork 主线，只在 secure 页表写入点依赖 OpenSBI”
+- Why:
+  - 当前原型中的局部旁路实现已稳定暴露 `pgtables_bytes` 与 child leaf accounting 缺口
+  - 若未来希望承载 Ubuntu 级 workload，继续维护这类特化旁路的长期成本会更高
+  - 项目已有先例说明 Linux 可以读取相关 secure 页表信息，只在写点借助 OpenSBI
+  - `semantic replay` 容易误导 coder 走平行实现，而非回接 Linux 原生路径
+- Evidence:
+  - `logs/fork_exec_default_freshwait_20260317_qemu_20260317_151037.log`
+  - `docs/workflow/PLAN_20260318_linux_friendly_fork.md`
+- Impact:
+  - coder 后续修 fork 时，应优先考虑重新接回 `copy_page_range()` 一侧的标准 Linux 语义
+  - OpenSBI 的职责应尽量收敛为 secure 页表写辅助，而非长期包办整个 child page-table copy 语义
+  - planner 在方案比较时，应把“是否更接近 Linux 原生路径、是否仅在必要写点依赖 OpenSBI”作为主评估标准
+- Supersedes:
+  - 隐含地替代“当前原型里的局部旁路可直接演化为最终 fork 模型”的默认假设
+  - 同时澄清并替代此前容易被理解为 `Linux semantic replay` 的模糊表述
+
 ### [2026-03-17] `docs/workflow/` 作为当前工作流层
 
 - Status: accepted
