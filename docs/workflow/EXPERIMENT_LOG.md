@@ -16,12 +16,12 @@
 
 ---
 
-## 2026-03-17 Placeholder
+## 2026-03-22 simple fork smoke（待补日志路径）
 
-- Date/Time: 待补
-- Goal: 重新整理 fork+exec 主线的共享状态与下一步验证顺序
-- Command Run: 文档整理，无实验命令
-- Expected Result: 建立稳定交接面，降低后续 agent 切换成本
-- Actual Result: `docs/workflow/` 已建立，待下一次真实实验后追加新条目
-- Artifact/Log Path: `docs/workflow/`
-- Conclusion: 下一条应记录真实 build/debug/test 日志
+- Date/Time: 2026-03-22，准确时间待补
+- Goal: 确认最小 fork smoke 是否已能正常通过
+- Command Run: `docker run --security-opt seccomp=unconfined --rm busybox sh -c "cat /etc/hostname; echo done"`
+- Expected Result: 输出主机名与 `done`，容器正常退出，不出现明显 kernel BUG
+- Actual Result: 用户口头报告“看起来可以通过”
+- Artifact/Log Path: 待补
+- Conclusion: 这条命令可作为当前 Tier 0 基线，但必须尽快补 checkpoint 与日志路径，并继续推进 Tier 1 / Tier 2
