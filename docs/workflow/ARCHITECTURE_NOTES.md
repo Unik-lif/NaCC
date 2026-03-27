@@ -23,6 +23,29 @@
 - 两层若不同步，会导致“Linux 认为已进入 NaCC，但运行时状态不匹配”的问题
 - 更完整说明见 `docs/agent/NACC_KNOWLEDGE_BASE.md`
 
+### 多进程运行时上下文分层
+
+- 当前进一步收敛出的结论是：`CSR_NACC_STATE` 不适合作为“完整进程状态寄存器”，它更像 hart-local runtime mode。
+- 若系统目标是“protected user trap first landing 必须先到 agent，再按策略 delegate Linux，最后先回 agent”，那么真正需要的是：
+  - per-hart loaded runtime state
+  - per-thread secure runtime context
+  - per-mm secure address-space state
+  - Linux semantic state
+- 其中最关键的新对象是 OpenSBI 一侧维护的 `per-thread Secure Runtime Context`：
+  - 应承载 continuation / return ownership
+  - 而不是继续把这些语义零散塞进 `CSR_NACC_STATE`、`trampoline`、`nacc_sstatus` 的 hart-local 临时变量里
+- 当前 accepted invariants：
+  - `AGENT` 只是 transient hart execution mode
+  - schedule-in protected thread 时必须恢复完整 trusted runtime context，而不是只恢复 `cid/mode`
+  - protected user trap 的 first landing 必须由 hardware / monitor 强制进入 agent
+- 当前更具体的分层建议：
+  - `CSR_NACC_STATE`：保留为 hart-local loaded mode + active `cid`
+  - `TWIN_ENTRY`：尽量固定为可信 first-landing entry，而不是频繁变化的 per-thread 状态
+  - `trampoline/resume_pc`、`nacc_sstatus`：应提升为 per-thread continuation state
+  - `thread.nacc_flag`：继续承载 Linux 语义阶段，如 `INITED/FORKED/EXEC`
+  - `mm->context.nacc_state`：继续承载 secure mm active/reclaim/ownership
+- 这条方向的完整展开见 `PLAN_20260327_secure_runtime_context.md`
+
 ### fork+exec 当前结构焦点
 
 - parent fork 时，Linux 跳过常规 `copy_page_range()`

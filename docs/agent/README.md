@@ -1,111 +1,122 @@
 # NaCC Agent Collaboration Notes
 
-这份文档是把 `AGENT.md` 与 `.agent/` 中可复用信息，整理成当前仓库的实用协作手册，便于后续快速迭代。
+This document reorganizes reusable information from `AGENTS.md` and the older `.agent/` material into a practical collaboration guide for this repository.
 
-会话切换时请先看：
+When switching into a fresh session, start with:
 
 - `docs/agent/SESSION_BOOTSTRAP.md`
-- `docs/agent/NACC_KNOWLEDGE_BASE.md`（长期稳定结论）
-- `docs/agent/BITTER_LESSONS.md`（高代价反例，先避免重复踩坑）
-- `docs/agent/REEXEC_DEBUG_20260312.md`（3 月 12 日这轮 same-PID `reexec` 收敛结果）
-- `docs/agent/FORK_DEBUG_20260315.md`（3 月 15 日这轮 fork+exec 主线收敛结果）
+- `docs/agent/NACC_KNOWLEDGE_BASE.md` for long-lived stable conclusions
+- `docs/agent/BITTER_LESSONS.md` for costly historical mistakes to avoid repeating
+- `docs/agent/REEXEC_DEBUG_20260312.md` for the March 12 same-pid reexec convergence results
+- `docs/agent/FORK_DEBUG_20260315.md` for the March 15 fork+exec convergence results
 
-## 1. 项目事实（长期有效）
+## 1. Long-Lived Project Facts
 
-- 核心代码目录：
-  - `linux/`：NaCC 内核钩子与 mm/fork/exec/reclaim 逻辑
-  - `opensbi/`：M-mode monitor 与 SBI 扩展实现
-  - `agent/`：bare-metal agent
-- 构建输出目录：
-  - `riscv-linux/`, `riscv-qemu/`, `riscv-linux-modules/`（尽量不手改）
-- 主要交流语言：中文（代码注释中英文均可）
+- Core code directories:
+  - `linux/`: NaCC kernel hooks plus mm / fork / exec / reclaim logic
+  - `opensbi/`: M-mode monitor and SBI extension implementation
+  - `agent/`: bare-metal agent
+- Build-output directories:
+  - `riscv-linux/`, `riscv-qemu/`, `riscv-linux-modules/`
+  - avoid editing them directly
+- Human collaboration used to be primarily Chinese; the current documentation entry set is being moved to English to make cross-agent reuse easier
 
-## 2. 高效工作流
+## 2. Efficient Workflow
 
-### 2.1 改完代码后的最小编译策略
+### 2.1 Minimal Build Strategy After Code Changes
 
-- 只改 OpenSBI：
+- OpenSBI only:
   - `make opensbi`
-- 只改 Linux：
+- Linux only:
   - `make linux-update`
-- 只改 Agent：
+- Agent only:
   - `make agent-update`
 
-### 2.2 调试循环
+### 2.2 Debug Loop
 
-1. `make debug` 启动 tmux 三分屏（QEMU/VM/GDB）。
-2. 复现实验。
-3. `make logger LOG=<tag>` 抓日志。
-4. 重点看 `logs/*qemu*.log` 的 Oops、page fault、fork/exec/reclaim 轨迹。
+1. Start `make debug` to open the QEMU / VM / GDB tmux layout.
+2. Reproduce the issue.
+3. Run `make logger LOG=<tag>` to capture logs.
+4. Focus on `logs/*qemu*.log` for oopses, page faults, and fork / exec / reclaim traces.
 
-### 2.3 关键排查点（NaCC 相关）
+### 2.3 NaCC-Specific Checkpoints
 
-- `thread.nacc_flag` 状态流是否正确：
+- verify `thread.nacc_flag` state flow when relevant:
   - `NACC_PREPARE -> NACC_INITED -> (fork child) NACC_FORKED -> NACC_RECLAIM`
-- fork 路径是否完成：
-  - OpenSBI 复制页表
-  - Linux 同步页表页 metadata（ctor/PTL）
-- exec/exit 回收是否走 NaCC 分支，避免普通 `kmem_cache_free` 路径误用。
+- verify the fork path covers:
+  - OpenSBI secure page-table copy or write assistance where expected
+  - Linux page-table metadata synchronization where required
+- verify exec / exit teardown uses the intended NaCC path instead of accidentally falling back to an ordinary free path
 
-## 3. 免密 sudo / 非交互 sudo
+## 3. Passwordless / Non-Interactive sudo
 
-`make modules-update` 已支持通过变量覆盖 sudo 命令：
+`make modules-update` already supports overriding the sudo command:
 
-- 默认行为（不变）：`make modules-update`（使用 `sudo`）
-- 非交互失败即退出：`make modules-update SUDO="sudo -n"`
-- 已在 root shell 中运行：`make modules-update SUDO=""`
+- default:
+  - `make modules-update`
+- fail immediately if passwordless sudo is unavailable:
+  - `make modules-update SUDO="sudo -n"`
+- already inside a root shell:
+  - `make modules-update SUDO=""`
 
-建议给当前用户配置最小权限 NOPASSWD（仅限必要命令），避免给全量 sudo 免密。
+Prefer giving the current user the smallest possible NOPASSWD permissions for the required commands instead of broad passwordless sudo.
 
-### 3.1 Wrapper 脚本（绝对路径版）
+### 3.1 Wrapper Script With Absolute Paths
 
-仓库内提供了示例脚本：
+The repo provides an example:
+
 - `docs/agent/nacc-modules-update.example.sh`
 
-推荐安装为 root 可执行脚本：
+Recommended installation flow:
 
 1. `sudo install -m 750 -o root -g root docs/agent/nacc-modules-update.example.sh /usr/local/sbin/nacc-modules-update`
 2. `sudo visudo -f /etc/sudoers.d/nacc-modules-update`
-3. 写入（把 `link` 改成你的用户名）：
+3. add a rule such as:
    - `link ALL=(root) NOPASSWD: /usr/local/sbin/nacc-modules-update`
 
-### 3.2 Makefile 新增入口
+### 3.2 Makefile Wrapper Entry
 
-保留原 `modules-update` 流程不变，新增：
+The original `modules-update` path remains unchanged. There is also:
+
 - `make modules-update-wrapper`
 
-默认使用：
+Default variables:
+
 - `ROOT_SUDO="sudo -n"`
 - `NACC_MODULES_UPDATE_WRAPPER="/usr/local/sbin/nacc-modules-update"`
 
-可覆盖示例：
+Override example:
+
 - `make modules-update-wrapper ROOT_SUDO="sudo -n" NACC_MODULES_UPDATE_WRAPPER="/usr/local/sbin/nacc-modules-update"`
 
-## 4. 后续建议
+## 4. Ongoing Documentation Discipline
 
-- 把每次 crash 根因和修复动作沉淀到 `record/*.md`，避免同类回归重复分析。
-- 若 fork/exec 路径再次变更，优先更新本目录文档，再改实现。
-- 长期稳定结论优先写入 `docs/agent/NACC_KNOWLEDGE_BASE.md`，避免只留在临时记录里。
-- 高代价误判、错日志、错回滚这类反例，优先写入 `docs/agent/BITTER_LESSONS.md`。
+- Record each crash root cause and repair action in `record/*.md` to avoid re-analyzing the same regression repeatedly.
+- If fork / exec paths change again, update this documentation layer before making the implementation diverge further.
+- Stable conclusions belong in `docs/agent/NACC_KNOWLEDGE_BASE.md`.
+- High-cost misreads, wrong-log incidents, or bad rollbacks belong in `docs/agent/BITTER_LESSONS.md`.
 
-## 5. Git 协作约定（当前）
+## 5. Git Collaboration Notes
 
-### 5.1 主仓库（NaCC）
+### 5.1 Top-Level NaCC Repo
 
-- 常见操作：
+- Common operations:
   - `git add record Makefile docs/agent`
   - `git commit -m "<message>"`
-- 推荐 message（比 `update` 更可读）：
+- Preferred message shape:
   - `[CODE]: update workflow docs and build wrapper targets`
 
-### 5.2 子仓库（linux/opensbi/agent/qemu）
+### 5.2 Subrepos (`linux/`, `opensbi/`, `agent/`, `qemu/`)
 
-- 常见操作（按你的习惯）：
+- Common habit:
   - `cd linux`
   - `git add *`
   - `git commit -m "[CODE]: xxxxx"`
   - `git push`
 
-建议后续 commit message 直接描述“模块 + 动作 + 目的”：
-- `linux`: `[CODE]: nacc fork consume ptp_list and register pagetable metadata`
-- `opensbi`: `[CODE]: nacc fork emit packed child ptp_list for linux sync`
+Recommended style:
+
+- describe `module + action + purpose`
+- examples:
+  - `linux`: `[CODE]: nacc fork consume ptp_list and register pagetable metadata`
+  - `opensbi`: `[CODE]: nacc fork emit packed child ptp_list for linux sync`

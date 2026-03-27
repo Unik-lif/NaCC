@@ -2,103 +2,157 @@
 
 ## Purpose
 
-负责一次受控测试循环：
-- 检查 `qemu` / `linux` / `opensbi` / `agent` 是否有改动
-- 按 `Makefile` 约定编译有改动的部件
-- 运行 `make debug`
-- 执行人当前给出的测试命令
-- 在 tmux 里开一个小 pane 运行 `make logger`
-- 结束后只回报结果和日志路径
+Run one controlled test loop:
 
-它不是 planner，不负责改计划；也不是 log analyzer，不负责分析日志。
+- check whether `qemu` / `linux` / `opensbi` / `agent` have local changes
+- compile only the components that changed, using the project `Makefile`
+- start `make debug VM_AUTO_CMD='...'` with the exact user-provided command
+- run `make logger` in a small tmux pane
+- report only execution status and log paths
+
+This role is not planner and does not change plans.
+This role is not log analyzer and does not explain failures.
 
 ## Read First
 
 1. `docs/workflow/CURRENT_STATE.md`
 2. `docs/workflow/KNOWN_GOOD.md`
-3. 当前用户给出的测试命令
+3. the user-provided test command for this round
 
 ## Input
 
-最少需要：
-- 本轮测试命令
+Minimum required input:
 
-可选：
-- 日志标签
-- 是否强制重编某个部件
+- the test command for this round
+
+Expected input format:
+
+- users usually provide a full command such as:
+  - `docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo alpha | wc -c; echo done"`
+- pass that full command into `VM_AUTO_CMD`
+- do not permanently rewrite `config/vm_link.sh` for a one-off test
+
+Optional input:
+
+- log tag
+- whether a specific component must be rebuilt
+- whether the run is a batch run
+
+## Batch Mode
+
+When the user provides multiple commands or explicitly asks for repeated/background execution:
+
+- prefer:
+  - `config/debug-batch.sh`
+- recommended detached launcher:
+  - `tmux new-session -d -s <launcher> "cd /home/link/NaCC && config/debug-batch.sh --session-name <batch-session> --cmd-file <file> > logs/<batch-session>.launcher.log 2>&1"`
+- `debug-batch.sh` will:
+  - create a detached tmux session for the whole batch
+  - open a fresh `test-runner` window for each command
+  - wait about 3 extra minutes after `[NaCC] Auto-running:`
+  - run `make logger` automatically
+  - clean up successful windows and keep failed ones
+- default reporting policy:
+  - report the `launcher.log` path first
+  - do not follow `launcher.log` continuously by default
+- only if explicitly asked, use:
+  - `tail -f logs/<batch-session>.launcher.log`
+- for manual takeover:
+  - `tmux attach -t <batch-session>`
 
 ## Procedure
 
-### 1. 检查部件改动
+### 1. Check local modifications
 
-依次检查：
+Inspect:
+
 - `git -C qemu status --short`
 - `git -C linux status --short`
 - `git -C opensbi status --short`
 - `git -C agent status --short`
 
-若主仓只有 `config/`、`docs/`、`record/` 等改动，通常不触发编译，只记录。
+If the top-level repo only has `config/`, `docs/`, `record/`, etc. changed, usually no rebuild is needed.
 
-### 2. 按部件编译
+### 2. Build only changed components
 
-只对有改动的部件执行对应 `Makefile` 目标：
+Use the matching `Makefile` target:
 
-- `qemu/` 有改动：
+- if `qemu/` changed:
   - `make qemu`
-- `linux/` 有改动：
+- if `linux/` changed:
   - `make linux-update`
-- `opensbi/` 有改动：
+- if `opensbi/` changed:
   - `make opensbi`
-- `agent/` 有改动：
+- if `agent/` changed:
   - `make agent-update`
 
-说明：
-- `linux-update` 已包含 `final-image`
-- `agent-update` 已包含 `final-image`
-- 若同时改了 `opensbi` 和 `linux/agent`，先跑 `make opensbi`，再跑对应 update 目标
+Notes:
 
-### 3. 启动调试环境
+- `linux-update` already includes `final-image`
+- `agent-update` already includes `final-image`
+- if both `opensbi` and `linux/agent` changed, build `opensbi` first
 
-- 每一轮测试都必须新开一套调试环境，不要在上一轮已经执行过命令的 VM/QEMU 状态上直接复用
-- 若已有旧的 test-runner tmux session 或旧的 QEMU/VM/GDB pane，应先结束旧环境，再启动新环境
-- 在 tmux 中运行 `make debug`
-- 确认 pane 标题存在：
+### 3. Start a fresh debug environment
+
+- every run must start from a fresh debug environment
+- do not reuse a VM/QEMU/GDB state that already executed a previous command
+- if an old `test-runner` session or old QEMU/VM/GDB pane still exists, clean it up first
+- run:
+  - `make debug VM_AUTO_CMD='<the exact test command>'`
+- verify pane titles:
   - `nacc-qemu`
   - `nacc-vm`
   - `nacc-gdb`
+- verify that `nacc-vm` shows:
+  - `[NaCC] Auto-running: ...`
+  with the real command for this round
+- in batch mode, avoid cluttering the current interactive tmux session; prefer a detached batch session
 
-### 4. 执行当前测试命令
+### 4. Let the command run
 
-- 优先把用户本轮给出的命令直接发到 `nacc-vm` pane
-- 不要为单次实验永久改写 `config/vm_link.sh`
-- 若 VM 尚未 ready，先等待连接成功，再发送命令
-- 若系统已经启动、SSH 已连上，但业务命令还没回显，不要立刻判失败；额外再等待约 3 分钟后再下结论并抓日志
+- do not manually re-send the workload command in normal flow
+- if `VM_AUTO_CMD` failed and the auto-running command is wrong, stop the round and fix the flow instead of mixing manual execution into the same run
+- do not permanently rewrite `config/vm_link.sh` for a single experiment
+- if the VM is not ready yet, wait for SSH and the auto command to begin
+- if the system is up and SSH is connected but the business command has not echoed yet, do not fail immediately; wait about 3 more minutes before deciding
 
-### 5. 开一个小 pane 抓日志
+### 5. Open a small pane for logs
 
-- 在当前 tmux window 新开一个较小 pane
-- 运行：
+- create a small pane in the current tmux window
+- run:
   - `make logger LOG=<tag>`
-- 目标是同时抓取当前的 QEMU 和 VM pane 输出
+- the goal is to capture both QEMU and VM pane output for this round
 
-### 6. 结束后通知人
+### 6. Clean up after log capture
 
-只汇报：
-- 哪些部件被判定为 modified
-- 实际执行了哪些编译命令
-- 测试命令是否跑完
-- 最新日志路径
-- 是否需要人工介入
+- after `make logger` succeeds, close the current test-runner tmux window by default
+- only keep the window if the user explicitly wants the live scene preserved
+- do not clean up before the log path is confirmed
 
-不要顺带做日志分析。
+### 7. Final report
+
+Report only:
+
+- which components were modified
+- which build commands were actually run
+- whether the test command finished
+- latest log paths
+- in batch mode, also report:
+  - batch session name
+  - launcher log path
+  - if the batch is still running, say that progress can be followed from the launcher log later
+- whether manual intervention is needed
+
+Do not include root-cause analysis.
 
 ## Guardrails
 
-- 如果没有收到明确测试命令，先要命令，不要自作主张换场景。
-- 如果某个部件编译失败，立即停止后续步骤，并回报失败部件和失败命令。
-- 如果 `qemu/` 出现大面积脏修改，先提醒用户这是高成本重编目标，再继续。
-- 如果用户开始要求解释 crash 根因，提示应切换给 log analyzer。
-- 如果用户开始要求改实现，提示应切换给 coder。
+- If no clear test command was provided, ask for one.
+- If any component build fails, stop immediately and report the failing component and command.
+- If `qemu/` is heavily dirty, warn first because rebuilding QEMU is high-cost.
+- If the user starts asking for a crash explanation, route to log analyzer.
+- If the user starts asking for code changes, route to coder.
+- If `make logger` fails, do not clean up first; preserve the scene and report the failure.
 
 ## Output Shape
 

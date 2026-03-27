@@ -1,65 +1,63 @@
 # NaCC Bitter Lessons
 
-这份文档只记录“已经踩过、且代价足够大”的反例，目标是避免在长对话、压缩上下文、跨多轮调试时再次重复。
+This document records only mistakes that were already made and were costly enough to deserve institutional memory.
 
-## 1. 2026-03-15：读错日志，导致判断链整体偏移
+## 1. 2026-03-15: Misreading the log shifted the whole reasoning chain
 
-### 1.1 发生了什么
+### 1.1 What happened
 
-- 当时用户明确要求基于 `2026-03-15` 的最新 fork+exec 调试状态继续推进。
-- 实际分析过程中，错误地沿用了更早一轮 `2026-03-14` 日志的结论。
-- 在此错误前提下：
-  - 对退出路径做了新的 root cause 推断；
-  - 追加了一组 `invoke ptp list / 公共退出 reclaim` 相关修改；
-  - 后续又因为用户指出日志看错，进行了过度回收。
-- 结果是：
-  - 分析方向与当前真实运行状态脱节；
-  - 回收范围大于实际应回收范围；
-  - 代码分支被拉离“当时还能正常唤醒 agent 并进入初始化”的工作状态。
+- The user explicitly asked to continue from the latest 2026-03-15 fork+exec debugging state.
+- The analysis accidentally reused conclusions from an older 2026-03-14 log.
+- On top of that wrong starting point:
+  - new root-cause guesses were made about exit behavior
+  - another round of `invoke ptp list / shared reclaim`-style changes was added
+  - after the user noticed the wrong log, the rollback was broader than necessary
+- Result:
+  - analysis drifted away from the real current runtime state
+  - rollback scope exceeded the actual mistake
+  - the code branch moved away from the last known state that could still wake the agent and initialize correctly
 
-### 1.2 直接教训
+### 1.2 Direct lessons
 
-1. **任何 root cause 判断前，必须先钉死本轮唯一有效日志。**
-   - 必须明确：
-     - 精确文件名
-     - 时间戳
-     - 是否是本轮新实验
-   - 不能用“最近我看过的那份日志”代替“这次用户指定的日志”。
+1. **Before making any root-cause claim, pin down the one log that actually belongs to this round.**
+   - confirm:
+     - exact file name
+     - exact timestamp
+     - whether it is really the current experiment
+   - never substitute "the most recent log I remember reading" for "the log the user specified"
 
-2. **不要把旧结论默认延续到新轮次。**
-   - 即使问题表面相似，只要日志时间戳变了，就必须重新建立最小上下文。
-   - 尤其是 fork / exec / reexec 这几条线，表象相近，但首因很容易已经移动。
+2. **Do not carry old conclusions into a new round by default.**
+   - even if the symptoms look similar, a new timestamp means a new minimum context must be rebuilt
+   - this is especially true for fork / exec / reexec lines, where symptoms can look similar while the first bad point has moved
 
-3. **回滚或“恢复到之前状态”时，不要靠记忆补逻辑。**
-   - 如果用户要“只恢复上一轮那组修改”，就只恢复那组明确 diff。
-   - 不要顺手把自己推断出来的“相关链路”一起回退或一起重做。
+3. **During rollback or restore, do not reconstruct logic from memory.**
+   - if the user asks to restore one earlier change set, restore that explicit diff and nothing larger
+   - do not roll back or reapply inferred "related logic" casually
 
-4. **长对话压缩后，历史记忆不应被当成 ground truth。**
-   - 历史摘要只能作为索引，不能替代对当前文件和当前日志的重新核对。
+4. **Compressed conversation memory is not ground truth.**
+   - historical summaries are an index, not a substitute for checking the current files and the current logs again
 
-### 1.3 后续强制流程
+### 1.3 Mandatory workflow after this lesson
 
-后续遇到类似多轮调试场景，必须先执行下面这套最小流程：
+When a similar multi-round debugging scenario appears:
 
-1. 用户指定了日志：
-   - 先复述并核对具体日志路径。
-2. 只从那一轮日志抽取最小事实：
-   - 首个致命点
-   - 相关调用链
-   - 本轮新增/消失的现象
-3. 在动代码前，明确区分：
-   - 这轮日志直接支持的事实
-   - 只是从旧轮次继承来的猜测
-4. 若用户要求“恢复之前改动”：
-   - 以明确文件/明确 diff 为单位恢复
-   - 不额外补推断性修复
+1. If the user specifies a log:
+   - restate and verify the exact path first
+2. Extract only the minimum facts from that round:
+   - first fatal point
+   - relevant call chain
+   - phenomena newly appearing or disappearing in this round
+3. Before changing code, separate:
+   - facts directly supported by this round's log
+   - guesses inherited from older rounds
+4. If the user asks to restore earlier changes:
+   - restore by explicit file / explicit diff
+   - do not add extra inferred repairs in the same step
 
-### 1.4 对 NaCC 项目的具体提醒
+### 1.4 Specific reminder for NaCC
 
-- fork / exec / reexec 三条线很容易互相污染判断。
-- `VM_NACC`、`agent aperture`、`NACC_RECLAIM`、`ptp_list`、`agent init` 这些关键词在不同轮次都可能出现，但首因未必相同。
-- 只要日志轮次错了，后面哪怕代码读得很细，仍然会在错误问题上做“正确优化”。
+- fork / exec / reexec lines easily contaminate each other's diagnosis
+- `VM_NACC`, `agent aperture`, `NACC_RECLAIM`, `ptp_list`, and `agent init` may appear in many rounds but do not imply the same root cause
+- if the log round is wrong, even careful code reading can produce a "correct optimization for the wrong problem"
 
----
-
-这条记录不是为了追责，而是为了把代价高的失误显式制度化。
+This record is not about blame. It exists to make an expensive mistake explicit and procedural.

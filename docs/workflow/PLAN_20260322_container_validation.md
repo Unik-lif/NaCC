@@ -2,30 +2,32 @@
 
 ## Goal
 
-- 在 fork smoke 初步可通过之后，建立一套分层验证路线，用来判断 NaCC 是否已经具备容器场景需要的基础 Linux 语义。
-- 特别强调：**容器背景下的多进程共享内存与 `mmap` 不是可选项，而是论文出发点之一。**
+- After partial fork-smoke progress, establish a layered validation route that answers whether NaCC already provides the baseline Linux semantics required for container workloads.
+- Shared memory and `mmap` are not optional extras. They are part of the project motivation.
 
 ## Why Shared Memory / `mmap` Matters
 
-- 容器里的多进程服务常依赖共享内存、文件映射和 `MAP_SHARED` 建立进程间数据通道。
-- 动态链接、共享库、文件页缓存、匿名映射、`/dev/shm`、Python/Node/数据库类运行时，都会大量触发 `mmap` 相关语义。
-- 因此，若 NaCC 想宣称自己支持“真实容器 workload”，就不能只证明 `fork + exec` 能走通；还要证明：
-  - 多进程可以共享映射
-  - child/peer 进程可以看到共享写入
-  - teardown 后不会破坏计数与页状态
+- Multi-process container services often rely on shared memory, file mappings, and `MAP_SHARED`.
+- Dynamic linking, shared libraries, file page cache, anonymous mappings, `/dev/shm`, and higher-level runtimes such as Python, Node, or databases all exercise `mmap` semantics heavily.
+- Therefore, "fork + exec works" is not enough. NaCC must eventually show:
+  - shared mappings visible across processes
+  - parent/child or peer processes observing shared writes correctly
+  - teardown without accounting or page-state corruption
 
 ## Strategy
 
-- 不直接在“真实应用”和“压力测试”之间二选一。
-- 采用 **coverage-first -> real-app -> targeted-stress** 的顺序。
-- 每一层都用尽量短的命令覆盖一种明确语义，避免一上来就用大应用把信号混杂。
+- Do not force a binary choice between "real applications" and "stress testing".
+- Use the order:
+  - **coverage-first -> real-app -> targeted-stress**
+- Each tier should use short commands that isolate one semantic at a time.
 
 ## Tier 0: Baseline Regression
 
-目标：
-- 固化当前最小可通过 fork smoke
+Goal:
 
-建议命令：
+- freeze the current minimum smoke baseline
+
+Suggested commands:
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm busybox sh -c "cat /etc/hostname; echo done"
@@ -39,16 +41,18 @@ docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo alpha | wc
 docker run --security-opt seccomp=unconfined --rm busybox sh -c "for i in 1 2 3 4 5; do /bin/true; done; echo done"
 ```
 
-通过标准：
-- 命令返回 0
-- 无明显 kernel BUG / panic / `Bad rss-counter state` / `Bad page state`
+Pass criteria:
+
+- command returns 0
+- no obvious kernel BUG / panic / `Bad rss-counter state` / `Bad page state`
 
 ## Tier 1: Process Semantics
 
-目标：
-- 验证多 child、`wait`、pipeline、短命并发进程等基本容器用户态语义
+Goal:
 
-建议命令：
+- validate multi-child behavior, `wait`, pipelines, and short-lived concurrent processes
+
+Suggested commands:
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm busybox sh -c "for i in 1 2 3 4 5 6 7 8; do (echo child-$i)& done; wait; echo done"
@@ -62,17 +66,21 @@ docker run --security-opt seccomp=unconfined --rm busybox sh -c "sh -c 'echo inn
 docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo one | cat | wc -l; echo done"
 ```
 
-通过标准：
-- 无 child 卡死、`wait` 异常、异常退出码
-- 无 teardown 后计数损坏
+Pass criteria:
+
+- no hanging child
+- no abnormal `wait`
+- no suspicious exit code
+- no post-teardown accounting corruption
 
 ## Tier 2: Shared Memory / `mmap`
 
-目标：
-- 验证多进程共享内存与 `mmap` 语义
-- 这是当前阶段的重点，不应晚于“真实应用”测试
+Goal:
 
-### 2A. 匿名共享映射 + `fork`
+- validate multi-process shared-memory and `mmap` semantics
+- this is the current priority tier and should not be postponed behind "real applications"
+
+### 2A. Anonymous shared mapping plus `fork`
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm python:3.11-slim python - <<'PY'
@@ -88,10 +96,11 @@ print(buf[:11].decode())
 PY
 ```
 
-预期：
-- 输出 `hellochild!`
+Expected output:
 
-### 2B. 文件映射 + child 写回
+- `hellochild!`
+
+### 2B. File-backed mapping plus child writeback
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm python:3.11-slim python - <<'PY'
@@ -113,8 +122,9 @@ os.unlink(path)
 PY
 ```
 
-预期：
-- 输出 `data`
+Expected output:
+
+- `data`
 
 ### 2C. `multiprocessing.shared_memory`
 
@@ -138,20 +148,23 @@ shm.unlink()
 PY
 ```
 
-预期：
-- 输出 `ping`
+Expected output:
 
-通过标准：
-- parent/child 之间共享写入可见
-- 无异常 page fault / BUG / 计数损坏
+- `ping`
+
+Pass criteria:
+
+- shared writes are visible across parent and child
+- no abnormal page fault / BUG / accounting corruption
 
 ## Tier 3: Small Real Applications
 
-目标：
-- 在基本语义通过后，跑一批“小而真实”的用户态
-- 不直接上完整 Ubuntu 镜像
+Goal:
 
-建议命令：
+- run a small set of realistic user-space programs after basic semantics pass
+- do not jump directly to full Ubuntu
+
+Suggested commands:
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm python:3.11-slim python -c "import subprocess; print(subprocess.check_output(['sh','-c','echo hi']).decode().strip())"
@@ -165,19 +178,20 @@ docker run --security-opt seccomp=unconfined --rm bash:5.2 sh -c "for i in 1 2 3
 docker run --security-opt seccomp=unconfined --rm nginx:alpine nginx -t
 ```
 
-选择原则：
-- 动态链接
-- 多进程或会 spawn child
-- 会用到文件 IO / 配置解析 / 共享库 / `mmap`
+Selection rule:
+
+- dynamic linking
+- multi-process or child-spawning behavior
+- file I/O / config parsing / shared libraries / `mmap`
 
 ## Tier 4: Targeted Stress
 
-目标：
-- 不做盲目压力，而是围绕已经通过的关键语义做重复与并发
+Goal:
 
-建议命令：
+- do not do blind stress
+- stress only the semantics that have already passed at smaller scale
 
-### 4A. 当前 fork smoke 循环 100 次
+### 4A. Current fork smoke looped 100 times
 
 ```bash
 for i in $(seq 1 100); do
@@ -185,13 +199,13 @@ for i in $(seq 1 100); do
 done
 ```
 
-### 4B. 并发 8 路短命容器
+### 4B. Eight-way short-lived container concurrency
 
 ```bash
 seq 1 8 | xargs -I{} -P8 docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo parallel-{}; cat /etc/hostname >/dev/null; echo done"
 ```
 
-### 4C. 共享内存测试循环
+### 4C. Shared-memory loop
 
 ```bash
 for i in $(seq 1 50); do
@@ -209,30 +223,31 @@ PY
 done
 ```
 
-观察重点：
-- 稳定性
+What to watch:
+
+- stability
 - teardown / reclaim
 - `rss`
 - `pgtables_bytes`
-- 是否出现 `Bad page map / state`
+- `Bad page map / state`
 
 ## Tier 5: Later Milestones
 
-- 完整 Ubuntu 级 workload
-- 更重的多进程服务
-- 长时间运行稳定性
-- 安全 hardening
+- Ubuntu-class workloads
+- heavier multi-process services
+- long-duration stability
+- security hardening
 
 ### Bitmap Protection
 
-- `bitmap` 防护应纳入长期计划，但不放在当前 fork/mmap 语义收敛之前。
-- 推荐顺序：
-  1. 先把 fork + `mmap` + shared memory 基础语义做稳
-  2. 再做 `bitmap` 防护，作为后续 hardening 项
+- `bitmap` protection belongs to the long-term plan, but should not be pulled ahead of fork / `mmap` / shared-memory semantic convergence.
+- Recommended order:
+  1. stabilize fork + `mmap` + shared-memory semantics
+  2. add `bitmap` protection as a later hardening item
 
-## Exit Criteria For “Ready To Try Ubuntu”
+## Exit Criteria For "Ready To Try Ubuntu"
 
-- Tier 0 到 Tier 2 稳定通过
-- 至少 2 到 3 个 Tier 3 小应用稳定通过
-- Tier 4 的循环与并发测试不再稳定触发计数/页状态损坏
-- 之后再把 Ubuntu 作为“更高层验收 workload”，而不是当前最先跑的目标
+- Tier 0 to Tier 2 are stable
+- at least 2 to 3 Tier 3 small applications pass stably
+- Tier 4 loop and concurrency runs stop reliably reproducing accounting / page-state corruption
+- only then should Ubuntu be treated as a higher-level validation workload instead of the immediate next step

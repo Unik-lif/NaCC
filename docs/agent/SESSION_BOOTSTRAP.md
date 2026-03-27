@@ -1,108 +1,148 @@
-# NaCC Session Bootstrap (Fast Start)
+# NaCC Session Bootstrap
 
-适用场景：新开对话窗口后，快速恢复上下文，不依赖历史长对话。
+Use this document to recover project context quickly in a fresh session without relying on long chat history.
 
-先看顺序建议：
-1. 如果想知道“现在在做什么”，先看 `docs/workflow/CURRENT_STATE.md`
-2. 如果想知道“这一轮接下来怎么协作”，再看 `docs/workflow/README.md`
-3. 如果想知道“项目稳定设计和关键入口”，再读本文件
-4. 若遇到大段原始日志，优先交给 log analyzer，会话不要混角色
+Recommended read order:
 
-配套长期知识库：
-- `docs/agent/NACC_KNOWLEDGE_BASE.md`（状态机、常见告警根因、测试映射）
-- `docs/agent/BITTER_LESSONS.md`（高代价反例，开工前先避免重复失误）
+1. If you want to know what is happening right now, open `docs/workflow/CURRENT_STATE.md`
+2. If you want to know how this round should be coordinated, open `docs/workflow/README.md`
+3. If you want stable design conclusions and code-entry references, read this file
+4. If a session contains large raw logs, route them to log analyzer instead of mixing roles
 
-## 1. 当前项目基线（截至 2026-03-08）
+Companion long-lived documents:
 
-- 主仓库：`/home/link/NaCC`
-- 子仓库：
-  - `linux/`（branch: `main`）
-  - `opensbi/`（branch: `NoPIC`）
-- 已推送的关键提交：
-  - `linux`: `45bba6df3a21`  
-    `[CODE]: nacc fork consume ptp_list and register child pagetable metadata`
-  - `opensbi`: `38b0542`, `ba828aa`  
-    `[CODE]: nacc fork emit packed child ptp_list for linux sync`  
-    `[CODE]: ignore compile_commands artifacts in opensbi`
-  - `NaCC` 主仓：`5583d37`, `376462e`  
-    `[CODE]: add fork ptp_list notes and modules-update wrapper workflow`  
-    `[CODE]: ignore compile_commands artifacts in root repo`
+- `docs/agent/NACC_KNOWLEDGE_BASE.md`
+- `docs/agent/BITTER_LESSONS.md`
 
-## 2. 关键设计结论（fork 元数据同步）
+## 1. Project Baseline
 
-- NaCC parent fork 时，Linux 跳过常规 `copy_page_range()`，由 OpenSBI 复制用户页表树。
-- 复制后，Linux 需要补齐 child 页表页 metadata（ptdesc/PTL ctor）。
-- 当前采用 **OpenSBI 回传 `ptp_list`** 的方案，而不是 Linux 自行 walk child 页表：
-  - 每个条目是 64-bit packed：`new_pfn + level`。
-  - Linux 按 `level` 调 `pagetable_pmd_ctor/pagetable_pte_ctor`。
-  - overflow 由 `nr_entries > capacity` 判定。
+- repo root: `/home/link/NaCC`
+- subrepos:
+  - `linux/` (branch: `main`)
+  - `opensbi/` (branch: `NoPIC`)
 
-## 3. 关键代码入口（先看这些）
+Key pushed commits referenced in the recent workflow:
+
+- `linux`: `1f2f4c92d67f`
+  - `[CODE]: linux attach forked child and unify exec state`
+- `opensbi`: `8d77341`
+  - `[CODE]: opensbi add child attach and exec path cleanup`
+- `linux`: `45bba6df3a21`
+  - `[CODE]: nacc fork consume ptp_list and register child pagetable metadata`
+- `opensbi`: `38b0542`, `ba828aa`
+  - `[CODE]: nacc fork emit packed child ptp_list for linux sync`
+  - `[CODE]: ignore compile_commands artifacts in opensbi`
+- top-level NaCC repo: `5583d37`, `376462e`
+  - `[CODE]: add fork ptp_list notes and modules-update wrapper workflow`
+  - `[CODE]: ignore compile_commands artifacts in root repo`
+
+## 2. Stable Design Conclusions
+
+- The current standard fork mainline is not legacy `nacc_fork` bypass. The real path is Linux-native `dup_mmap()/copy_page_range()`.
+- Child secure page-table construction depends on NaCC hooks inside the standard fork path:
+  - `__pte_alloc/__pmd_alloc` request secure PTP pages through SBI
+  - `set_pte/set_ptes` write secure PTPs through SBI when needed
+- `nacc_fork()` / `sm_nacc_fork()` remain only as legacy / compatibility paths and are no longer the semantic baseline.
+- `NACC_FORKED` children currently use:
+  - parent-side early `child pid -> cid` registration
+  - lightweight first-user-return attach on the child side
+  - convergence to `NACC_INITED + mm ACTIVE`
+- `exec` currently uses the `NACC_EXEC` transition state:
+  - the fresh exec `mm` is built first through ordinary Linux
+  - successful exec converges through `nacc_exec()/sm_nacc_exec()` to perform `transfer_ptp + VM_NACC + attach`
+  - same-pid exec and fork+exec now share this exec-attach chain
+- Historical names such as `SBI_EXT_*REEXEC` and `AGENT_REEXEC_ENTRY_OFFSET` are intentionally kept as ABI / fixed-entry names.
+- A newer accepted direction is now explicit:
+  - `CSR_NACC_STATE` should be treated as a hart-local runtime mode
+  - multi-process support likely requires an OpenSBI-owned per-thread secure runtime context rather than a single mode register acting as a full process state machine
+
+## 3. Key Code Entrypoints
 
 ### Linux
 
 - `linux/kernel/fork.c`
-  - `dup_mmap()` 中 NaCC 分支调用 `nacc_fork(...)`。
+  - `dup_mmap()` stays on the standard `copy_page_range()` path
 - `linux/arch/riscv/kernel/sys_riscv.c`
-  - `nacc_fork()`：分配 `ptp_list` 缓冲区、发起 SBI ecall、回收缓冲区。
+  - `nacc_attach_forked_child_if_needed()`
+  - `nacc_exec()`
 - `linux/arch/riscv/mm/nacc.c`
-  - `nacc_register_fork_ptp_list()`：解码 packed entry 并执行 ctor 注册。
+  - helper functions around NaCC `mm` state and page-table metadata
+- `linux/include/asm-generic/pgalloc.h`
+  - NaCC secure PTP allocation hooks
+- `linux/arch/riscv/include/asm/pgtable.h`
+  - secure `set_pte/set_ptes` write path
 - `linux/arch/riscv/include/asm/nacc.h`
-  - `ptp_list` 结构与 packed 编解码宏。
+  - `NACC_FORKED` / `NACC_EXEC` / `NACC_INITED` definitions
 
 ### OpenSBI
 
 - `opensbi/lib/sbi/sm/sm.c`
-  - `sm_nacc_fork(..., ptp_list_pa, ptp_list_bytes)`。
-- `opensbi/lib/sbi/sm/vm.c`
-  - `nacc_fork_copy_user(...)` 与 `nacc_fork_ptp_list_push(...)`。
+  - `sm_nacc_attach_forked_child()`
+  - `sm_nacc_exec()`
+  - thread-switch-side `CSR_NACC_STATE` updates
 - `opensbi/lib/sbi/sbi_ecall_nacc.c`
-  - `SBI_EXT_LINUX_FORK` 参数透传（含 ptp_list 地址和大小）。
-- `opensbi/include/sm/vm.h`, `opensbi/include/sm/sm.h`
-  - `ptp_list` 结构与函数签名。
+  - SBI dispatch for child attach / exec attach
+- `opensbi/include/sm/agent.h`
+  - fixed agent exec-attach entry offset
 
-## 4. 已知待关注项（新会话优先确认）
+### QEMU / Agent Runtime
 
-- `__pte_offset_map_lock()` 的 NaCC 分支防御性判空（`pte==NULL`）建议补上，避免异常路径 panic。
-- `NACC_FORKED` 在 `exec_mmap` 前 reclaim 路径一致性需复核（与 `NACC_INITED` 对齐）。
-- 目前是 prototype 语义：目标是 child 能稳定走到 `execve()`，不追求完整 Linux COW 语义。
-- same-PID `re-exec` 先看 `docs/agent/NACC_KNOWLEDGE_BASE.md` 第 6 节：
-  - agent 完整初始化链
-  - trap 代理链
-  - `sscratch/tp` 与 `__agent_exit/__trap_entry` 的关系
+- `qemu/target/riscv/op_helper.c`
+  - `helper_acall`
+  - `helper_aret`
+  - current hart-local runtime fields such as `nacc_state`, `nacc_sstatus`, and `trampoline`
+- `agent/src/entry.S`
+  - `__reexec_entry`
+  - `__trap_entry`
+  - `__agent_exit`
 
-## 5. 构建与调试最短路径
+## 4. Current Things To Re-Check In New Sessions
 
-- 仅 OpenSBI：
+- Add a defensive null check in the NaCC branch of `__pte_offset_map_lock()` to avoid panic on unusual paths.
+- Re-run `echo alpha | wc -c` on the latest fork/exec baseline; old filemap-root-cause claims cannot be reused blindly.
+- Keep the old `SBI_EXT_*REEXEC` / `AGENT_REEXEC_ENTRY_OFFSET` names stable unless ABI pressure justifies a change.
+- The project is still in prototype semantics. The near-term goal is to stabilize:
+  - non-exec child
+  - fork+exec
+  - same-pid exec
+- The newer high-value design question is trusted runtime-context ownership under multi-process execution.
+
+## 5. Shortest Build / Debug Path
+
+- OpenSBI only:
   - `PATH=/home/link/NaCC/riscv-tools/bin:$PATH make -C opensbi PLATFORM=generic CROSS_COMPILE=riscv64-unknown-linux-gnu- -j$(nproc)`
-- 仅 Linux（推荐走项目 Makefile）：
+- Linux update through project Makefile:
   - `make linux-update`
-- 调试循环：
+- debug loop:
   - `make debug`
   - `make logger LOG=<tag>`
-  - 看 `logs/*qemu*.log`
+  - inspect `logs/*qemu*.log`
 
-## 6. sudo / 模块更新（已优化）
+## 6. Modules Update / sudo
 
-- 保留原流程：`make modules-update`
-- 新增 wrapper 流程：`make modules-update-wrapper`
-  - 默认调用：`sudo -n /usr/local/sbin/nacc-modules-update`
-  - 示例脚本：`docs/agent/nacc-modules-update.example.sh`（全部绝对路径）
+- original path:
+  - `make modules-update`
+- wrapper path:
+  - `make modules-update-wrapper`
+  - default wrapper: `sudo -n /usr/local/sbin/nacc-modules-update`
+  - example script: `docs/agent/nacc-modules-update.example.sh`
 
-## 7. Git 协作约定（按当前习惯）
+## 7. Git Collaboration Habits
 
-- 主仓常见：`git add record Makefile docs/agent`
-- 子仓常见：
-  - `cd linux` / `cd opensbi`
+- top-level repo often uses:
+  - `git add record Makefile docs/agent`
+- subrepos often use:
+  - `cd linux`
   - `git add *`
   - `git commit -m "[CODE]: ..."`
   - `git push`
-- 推荐 message 风格：`[CODE]: <模块> <动作> <目的>`
+- preferred message style:
+  - `[CODE]: <module> <action> <purpose>`
 
-## 8. 新会话开工 checklist
+## 8. Fresh-Session Checklist
 
-1. 先看本文件 + `docs/agent/README.md` + `docs/agent/NACC_KNOWLEDGE_BASE.md` + `docs/agent/BITTER_LESSONS.md`。  
-2. `git -C linux status -sb`、`git -C opensbi status -sb`。  
-3. 确认本次目标落在 Linux / OpenSBI / 主仓哪一层。  
-4. 只改必要文件，尽量保持 patch 可 review。  
-5. 改完先最小编译验证，再讨论是否提交/推送。  
+1. Read this file plus `docs/agent/README.md`, `docs/agent/NACC_KNOWLEDGE_BASE.md`, and `docs/agent/BITTER_LESSONS.md`.
+2. Run `git -C linux status -sb` and `git -C opensbi status -sb`.
+3. Confirm whether the current task belongs mainly to Linux, OpenSBI, Agent, or the top-level repo.
+4. Touch only necessary files and keep patches reviewable.
+5. Do a minimal compile check before discussing commit / push.

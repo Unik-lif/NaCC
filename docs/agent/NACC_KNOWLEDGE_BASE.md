@@ -1,18 +1,22 @@
-# NaCC 长期知识库（fork/exec/re-exec/mm）
+# NaCC Knowledge Base
 
-> 目的：沉淀“已经反复验证过”的事实，减少重复踩坑。  
-> 更新原则：仅记录稳定结论；实验性猜测放 `record/*.md`。
+Purpose:
 
-## 1. 双层状态机（必须同时看）
+- preserve facts that have already been validated repeatedly
+- reduce repeated mistakes across long debugging cycles
 
-NaCC 实际有两层状态：
+Update rule:
 
-1. Linux 进程语义状态：`thread.nacc_flag`
-2. 运行时硬件状态：`CSR_NACC_STATE`（QEMU/OpenSBI）
+- keep only stable conclusions here
+- keep speculative ideas in `record/*.md`
 
-若两层不同步，会出现“Linux 认为是 NaCC，QEMU 认为不是”的卡住症状。
+## 1. State Layers Must Be Distinguished
 
-### 1.1 Linux `nacc_flag`
+NaCC does not have a single state machine. It has multiple layers.
+
+### 1.1 Linux semantic state
+
+Primary software-side task state currently includes:
 
 - `NACC_PREPARE = 0b001`
 - `NACC_INITED = 0b010`
@@ -20,7 +24,7 @@ NaCC 实际有两层状态：
 - `NACC_FORKED = 0b1000`
 - `NACC_REEXEC = 0b10000`
 
-典型链路：
+Typical historical flow:
 
 ```text
 NORMAL -> PREPARE -> INITED
@@ -29,289 +33,302 @@ INITED --(fork child)--> child:FORKED --(child exec)--> INITED
 INITED --(exit/exec teardown)--> RECLAIM
 ```
 
-### 1.2 `CSR_NACC_STATE`
+This layer expresses Linux-side task semantics, not trusted trap continuation.
+
+### 1.2 Hart-local runtime state
+
+`CSR_NACC_STATE` currently carries values such as:
 
 - `INACTIVE`
 - `AGENT`
 - `LINUX`
 - `MONITOR`
 
-关键约束：
+Important constraint:
 
-- `aret` 只在 `nacc_state == LINUX` 有效；否则 QEMU 会打印：
+- `aret` is meaningful only when `nacc_state == LINUX`
+- otherwise QEMU prints:
   - `Not in nacc process linux state. Simply omit it.`
 
----
+### 1.3 Newer design conclusion: runtime context must be layered further
 
-## 2. 关键不变量（当前版本）
+The newer accepted direction is:
 
-1. 只要一个 `mm` 持有 NaCC 安全 PTP，销毁前必须先进入 `RECLAIM` 语义。
-2. `INITED` 只能在 re-attach SBI 调用成功后设置，避免 trap 时序错窗。
-3. `nacc_flag` 是位标志，涉及组合态时不能依赖单纯 `==` 做状态分支。
+- `CSR_NACC_STATE` should not be treated as a full process-state register
+- it should be treated as a hart-local runtime mode register
+- multi-process support likely requires:
+  - per-hart loaded runtime state
+  - per-thread secure runtime context
+  - per-mm secure address-space state
+  - Linux semantic state
 
-### 2.1 2026-03-16 补充：`thread.nacc_flag` 与 `mm` 回收状态不要继续混用
+This matters because trusted first landing, delegation to Linux, and return-to-agent behavior cannot be modeled safely with only a mode bit plus `cid`.
 
-- 这轮 fork 调试暴露出的一个稳定结论是：`thread.nacc_flag` 更适合表达 task 执行态（如 `PREPARE/INITED/REEXEC`），不适合继续独占承载地址空间 teardown 策略。
-- `exit_mmap()`、`unmap_page_range()`、`free_pgtables()` 处理的是 `mm/VMA` 生命周期；若 special reclaim 是否命中仍只依赖 `current->thread.nacc_flag`，很容易因为某条隐蔽路径漏置位而把整个 `mm` 释放带偏。
-- 后续状态机应优先向“两层”收敛：
-  - task 侧保留 NaCC 执行态
-  - mm 侧补充 NaCC 地址空间/回收态
-- 当前已明确支持的场景只有：
-  - 纯 builtin 常规路径
-  - same-PID reexec 路径
-  fork 路径先不纳入这条长期结论的实现范围。
+## 2. Stable Invariants
 
----
+1. If an `mm` owns secure NaCC page-table pages, teardown must respect the correct reclaim semantics before destruction.
+2. `INITED` should only be set after the relevant re-attach / runtime handoff has succeeded.
+3. `nacc_flag` is a bitmask and should not be treated as a simple enum with `==` checks on mixed states.
 
-## 3. 高频告警的真实含义
+### 2.1 Do not keep mixing task semantic state and `mm` reclaim state
 
-## 3.1 `BUG: Bad rss-counter state`
+One stable lesson from fork debugging:
 
-触发点：
+- `thread.nacc_flag` is better suited to task execution phase
+- `mm` reclaim / teardown policy should not continue to depend solely on `thread.nacc_flag`
 
-- `__mmdrop()` 末尾 `check_mm()` 对 `mm->rss_stat[]` 做一致性检查。
+Why:
 
-本质：
+- `exit_mmap()`, `unmap_page_range()`, and `free_pgtables()` are `mm` / `VMA` lifetime logic
+- if reclaim policy depends only on the current task flag, one missed state transition can mis-handle the entire address space
 
-- `rss_stat` 和真实映射数量不一致（非 0、或被减成负数）。
+Preferred layering:
 
-NaCC 语境下高概率原因：
+- task-side execution state
+- mm-side secure address-space / reclaim state
 
-- fork bypass 跳过 `copy_page_range()`（Linux 不再给 child 做 RSS 记账），
-- 但 OpenSBI 又复制了 PTE，导致“有映射但没加账”，退出时再减账出现异常值。
+## 3. Meaning Of Frequent Warnings
 
----
+### 3.1 `BUG: Bad rss-counter state`
 
-## 3.2 `BUG: Bad page state in process ... pfn:xxxxx`
+Trigger point:
 
-触发点：
+- `check_mm()` near the end of `__mmdrop()`
 
-- 页回收到 buddy 前，`free_pages_prepare()` 检查 `struct page` 不满足预期。
+Meaning:
 
-本质：
+- `rss_stat` does not match real mappings
 
-- page 元数据不一致：`mapcount/refcount/mapping/flags` 有残留或错配。
+High-probability NaCC interpretation:
 
-NaCC 语境下常见两类：
+- Linux accounting for child mappings was skipped or not restored correctly
+- but mappings still existed and later teardown tried to subtract accounting that was never added
 
-1. PFN 落在 NaCC PTP 区间（如 `0x1b0000-0x1c0000`）却走了普通释放路径。
-2. 普通数据页在 fork bypass 后没有补齐 Linux 元数据（rmap/refcount/COW），
-   teardown 时出现 put/free 失衡。
+### 3.2 `BUG: Bad page state in process ... pfn:xxxxx`
 
----
+Trigger point:
 
-## 4. 测试命令到场景映射（`config/vm_link.sh`）
+- `free_pages_prepare()` detects inconsistent `struct page` metadata before returning pages to the buddy allocator
 
-以下命令可直接复用，日志请带场景标签。
+Meaning:
 
-### 4.1 直接执行（最小路径）
+- page metadata such as mapcount, refcount, mapping, or flags is inconsistent
 
-命令：
+Common NaCC interpretations:
+
+1. a PFN inside the NaCC PTP range was released through an ordinary path
+2. a normal data page lost Linux metadata consistency after a special fork / teardown path
+
+## 4. Useful Command-To-Scenario Mapping
+
+These commands are still useful as scenario anchors.
+
+### 4.1 Direct execution, shortest path
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm busybox echo test
 ```
 
-场景：
+Use for:
 
-- 非 `sh -c`，用于验证注册/初始化/退出回收最短链路。
+- shortest registration / initialization / exit path
 
-建议日志标签：
+Suggested log tag:
 
 - `smoke_echo`
 
-### 4.2 re-exec（同 PID）最小复现
-
-命令：
+### 4.2 Minimal same-pid reexec
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm busybox sh -c "cat /tmp/test.txt"
 ```
 
-场景：
+Use for:
 
-- `sh -c` 单外部命令，busybox 常走同 PID re-exec。
+- single external command under `sh -c`
+- BusyBox often takes a same-pid reexec path here
 
-建议日志标签：
+Suggested log tag:
 
 - `reexec_cat_only`
 
-### 4.3 re-exec（builtin + 外部命令）
-
-命令：
+### 4.3 Reexec with builtin plus external command
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo hello > /tmp/test.txt && cat /tmp/test.txt"
 ```
 
-场景：
+Use for:
 
-- 前半 builtin，后半外部命令，常用于观察 re-exec 中间态。
+- observing the transition between builtin execution and an external command in one shell script
 
-建议日志标签：
+Suggested log tag:
 
 - `reexec_builtin_plus_cat`
 
-### 4.4 builtin 对照组
-
-命令：
+### 4.4 Builtin-only control group
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm busybox sh -c 'echo hello; echo b; echo c'
 ```
 
-场景：
+Use for:
 
-- 纯 builtin，通常无 fork / 无 re-exec，适合作为低变量对照。
+- low-variance shell-only control
+- usually no fork and no reexec
 
-建议日志标签：
+Suggested log tag:
 
 - `builtin_only`
 
-### 4.5 fork+exec 关键场景
-
-命令：
+### 4.5 Fork+exec key scenario
 
 ```bash
 docker run --security-opt seccomp=unconfined --rm busybox sh -c "cat /etc/hostname; echo done"
 ```
 
-场景：
+Use for:
 
-- 父 shell 需要继续执行 `echo done`，典型 fork+exec 检查命令。
+- a parent shell that must continue after running an external command
+- one of the most important current fork+exec probes
 
-建议日志标签：
+Suggested log tag:
 
 - `fork_exec_cat_then_echo`
 
----
+## 5. Code Entrypoint Shortlist
 
-## 5. 代码入口速查（优先级顺序）
-
-Linux：
+### Linux
 
 - `linux/fs/exec.c`
-  - `begin_new_exec`（exec 前后 flag/reclaim 转移）
-  - `bprm_execve` 尾部（`nacc_invoke` / `nacc_invoke_child`）
+  - exec flag transitions
+  - `bprm_execve` tail
 - `linux/kernel/fork.c`
-  - `dup_mmap`（NaCC fork bypass + `nacc_fork`）
+  - `dup_mmap`
 - `linux/arch/riscv/kernel/process.c`
-  - `copy_thread`（child `NACC_FORKED`）
+  - `copy_thread`
 - `linux/mm/memory.c`
-  - `unmap_page_range`、`zap_pte_range`、`free_pte_range`
+  - `unmap_page_range`
+  - `zap_pte_range`
+  - `free_pte_range`
 - `linux/kernel/exit.c`
-  - `exit_group`（reclaim 入口）
+  - exit / reclaim entry
 - `linux/arch/riscv/kernel/traps.c`
-  - `do_trap_ecall_u` / `do_page_fault` / `do_irq` 的 aret 触发点
+  - user ecall, page fault, irq, and aret-related trap flow
 
-OpenSBI/QEMU：
+### OpenSBI / QEMU
 
 - `opensbi/lib/sbi/sm/sm.c`
-  - `sm_nacc_invoke` / `sm_nacc_invoke_child` / `sm_nacc_fork`
+  - attach / exec / switch-side runtime updates
 - `opensbi/lib/sbi/sm/vm.c`
-  - `nacc_fork_copy_user`（leaf wrprotect / child PTP 分配）
+  - secure page-table behavior in earlier fork paths
 - `qemu/target/riscv/op_helper.c`
-  - `helper_aret`（`nacc_state != LINUX` 直接 omit）
+  - `helper_aret`
+  - `helper_acall`
 
----
+## 6. Agent Initialization Versus Trap Proxying
 
-## 6. Agent 初始化与 Trap 代理链
+One common confusion:
 
-这一部分是 same-PID re-exec 讨论中最容易混淆的地方：  
-“agent 启动一次”与“后续每次用户 trap 都先经过 agent”不是一回事。
+- "agent booted once" is not the same as
+- "every later protected user trap still first lands in agent"
 
-### 6.1 完整初始化链
+### 6.1 Full initialization chain
 
-入口：
+Entry chain:
 
 - OpenSBI `agent_prepare(...)`
-  - `opensbi/lib/sbi/sm/agent.c`
-- Agent `_entry`
-  - `agent/src/entry.S`
-- Agent `main()`
-  - `agent/src/main.c`
+- agent `_entry`
+- agent `main()`
 - `vm_init()`
-  - `agent/src/vm.c`
 
-完整初始化时发生的事：
+What the full initialization chain does:
 
-1. OpenSBI 通过 `agent_prepare(...)` 把下面这些 Linux 侧锚点传给 agent：
+1. OpenSBI passes Linux-side anchors such as:
    - `_user_pt_regs`
    - `_do_irq`
    - `_excp_vect_table`
    - `_current_gp`
-   - 以及页表切换所需的 `offset/satp`
-2. Agent `_entry` 只负责把这些值写进 agent 全局变量，然后进入 `main()`
-3. `main()` 走 `mem_init()` + `vm_init()`
-4. `vm_init()` 建 agent 临时页表，切换回 Linux 页表语境
-5. `trap_init()` 安装后续 trap 代理入口
-6. `__agent_exit(_user_pt_regs)` 第一次把用户态上下文恢复出去
+   - plus page-table switch data
+2. agent `_entry` stores those values and enters `main()`
+3. `main()` runs `mem_init()` and `vm_init()`
+4. `vm_init()` prepares the agent page-table view and temporary mappings
+5. `trap_init()` installs later trap-proxy entry points
+6. `__agent_exit(_user_pt_regs)` performs the first return to user space
 
-结论：
+Conclusion:
 
-- `agent_prepare -> _entry -> main -> vm_init` 是一条“完整初始化链”
-- 这条链很重，不应默认用于 same-PID re-exec
+- `agent_prepare -> _entry -> main -> vm_init` is the heavy full initialization path
+- it should not be re-run by default for every same-pid reexec-like event
 
-### 6.2 Trap 代理链
+### 6.2 Trap proxy chain
 
-真正保护机密进程用户态上下文的关键，不在 `main()`，而在下面三段：
+The long-term security-critical part is the trap proxy chain:
 
 - `trap_init()` in `agent/src/trap.c`
 - `__trap_entry` in `agent/src/entry.S`
 - `__ret_from_exception` / `__agent_exit` in `agent/src/entry.S`
 
-语义如下：
+Semantic summary:
 
-1. `trap_init()`
-   - 分配 `_user_context`
-   - 写 `CSR_TWIN_ENTRY = __trap_entry`
-2. 用户态再次 trap 时，先进入 `__trap_entry`
-3. `__trap_entry`：
-   - 先 `csrrw tp, CSR_SSCRATCH, tp`
-   - 依赖 `sscratch` 中已经放好的 Linux kernel `tp`
-   - 把用户寄存器保存到 agent 私有 `_user_context`
-   - 再复制到 Linux 期望的 `pt_regs`
-   - 最后通过 `_do_irq` 或 `_excp_vect_table` 跳回 Linux
-4. Linux 异常返回时，经 `__ret_from_exception`
-   - 重新设置 `CSR_SSCRATCH`
-   - 恢复用户寄存器
-5. 首次从 agent 进入用户态则走 `__agent_exit(_user_pt_regs)`
+1. `trap_init()` allocates `_user_context` and writes `CSR_TWIN_ENTRY = __trap_entry`
+2. later user traps first enter `__trap_entry`
+3. `__trap_entry`:
+   - swaps `tp` with `CSR_SSCRATCH`
+   - relies on Linux kernel `tp` already being stored in `sscratch`
+   - saves user registers into the agent-private `_user_context`
+   - copies them into Linux-visible `pt_regs`
+   - dispatches back into Linux through `_do_irq` or `_excp_vect_table`
+4. Linux returns through `__ret_from_exception`, which restores the user-facing state
+5. the first return from agent to user space goes through `__agent_exit(_user_pt_regs)`
 
-结论：
+Conclusion:
 
-- 用户态上下文真正的“安全副本”在 agent 私有 `_user_context`
-- Linux 看到的 `pt_regs` 是 agent 拷贝出来的视图
-- `sscratch/tp` 约定是整条 trap 代理链能工作的重要前提
+- the real secure copy of user context is agent-private `_user_context`
+- Linux-visible `pt_regs` is a copied view
+- the `sscratch/tp` contract is critical
 
-### 6.3 对 same-PID re-exec 的直接启发
+### 6.3 Direct implication for same-pid reexec and multi-process runtime work
 
-当前稳定判断：
+Stable judgment:
 
-1. same-PID re-exec 的首要问题更像是“trap 出口/入口上下文没有接回去”，不是必须重跑整套 `main()/vm_init()`
-2. re-exec 之后很可能仍然需要：
-   - 在新 `mm` 上重新建立 agent 区域映射
-   - 刷新当前有效的 `_user_pt_regs`
-   - 保证重新回用户态时 `sscratch/tp` 语义正确
-3. `_do_irq` / `_excp_vect_table` / `_current_gp` 更像 Linux 内核侧静态锚点：
-   - 它们属于 trap shim 的环境参数
-   - 不是 same-PID re-exec 的主要变化源
+1. many same-pid reexec failures look more like broken trap-entry / trap-exit continuation than missing full agent initialization
+2. reexec still likely needs lightweight refresh of:
+   - agent-region mapping in the new `mm`
+   - current `_user_pt_regs`
+   - correct `sscratch/tp` semantics for the next user return
+3. `_do_irq`, `_excp_vect_table`, and `_current_gp` are more like static Linux-side trap-shim anchors than the primary source of semantic change
 
-当前设计倾向：
+Current design tendency:
 
-- `NACC_REEXEC` 不能复用 `nacc_invoke_child()`
-- 也不应默认退化成“再次完整 agent 初始化”
-- 更合理的目标是：
-  - 保留独立 `REEXEC` 路径
-  - 只做轻量 refresh
-  - 不重新跑 `agent main`
-  - 重点修复 `__agent_exit` / `__trap_entry` 相关的上下文接续
+- `NACC_REEXEC` should not simply reuse `nacc_invoke_child()`
+- it should not collapse into "run full agent init again"
+- a lighter refresh path is preferable
 
----
+## 7. Runtime-Context Direction
 
-## 7. 调试约定（建议）
+New accepted invariants:
 
-- 只保留“状态迁移级”日志，避免每 PTE 高频打印淹没关键信息。
-- 每次实验记录三元组：
-  - 命令（含完整 `docker run ...`）
-  - 场景标签（如 `reexec_cat_only`）
-  - 目标断言（如“无 second init”“child teardown 先 reclaim”）
+1. `AGENT` is a transient hart execution mode, not a persistent process lifecycle state
+2. scheduling a protected thread in must restore a full trusted runtime context
+3. first landing of protected user traps must be enforced by hardware / monitor, not chosen by Linux
+
+Practical implication:
+
+- future work should likely introduce an OpenSBI-owned per-thread secure runtime context
+- likely fields include:
+  - `cid`
+  - thread identity
+  - `saved_nacc_sstatus`
+  - `saved_resume_pc`
+  - `user_pt_regs` anchor
+  - trap-save anchor
+  - delegation / return flags
+
+## 8. Debugging Discipline
+
+- Prefer state-transition-level logs over per-PTE log floods when possible.
+- For each experiment, record:
+  - the exact command
+  - the scenario tag
+  - the target assertion

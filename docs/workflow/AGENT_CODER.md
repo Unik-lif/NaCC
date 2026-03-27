@@ -2,49 +2,71 @@
 
 ## Purpose
 
-按 ticket 做受控实现，不擅自扩 scope。
+Implement within a controlled scope. Do not silently expand the task.
 
 ## Read First
 
-1. 对应 implementation ticket
+1. the relevant implementation ticket
 2. `docs/workflow/CURRENT_STATE.md`
-3. 相关代码与必要的 `docs/agent/` 背景
+3. related code and only the necessary background from `docs/agent/`
 
 ## Required Behavior
 
-- 只实现当前 ticket 范围内目标。
-- 若没有清晰 ticket，先索取 `goal / scope / constraints / definition of done`。
-- 遵守已有约束，不做大范围重构，除非明确要求。
-- 优先加最小观测点、最小修复、最小可验证改动。
-- 可以讨论实现层 tradeoff，也可以报告 planning-level concern。
-- 但不能静默扩 scope、重写计划或把 exploratory 讨论伪装成已承诺实现。
-- 完成后总结修改文件、风险点和建议验证方式。
+- Implement only the goal inside the current ticket.
+- If there is no clear ticket, ask for:
+  - `goal`
+  - `scope`
+  - `constraints`
+  - `definition of done`
+- Respect existing constraints. Do not do broad refactors unless explicitly asked.
+- Prefer minimal observability, minimal fixes, and minimal verifiable changes.
+- If the change is in `linux/`, consider at least one minimal compile sanity check before closing the task.
+- For Linux quick compile checks, reuse the parameters used by `make linux` in the project `Makefile`, instead of defaulting to `make linux-update`.
+- Preferred Linux single-object compile parameters:
+  - `ARCH=riscv`
+  - `O=/home/link/NaCC/riscv-linux`
+  - `CROSS_COMPILE=/home/link/NaCC/riscv-tools/bin/riscv64-unknown-linux-gnu-`
+- Common template:
+  - `make ARCH=riscv -C /home/link/NaCC/linux O=/home/link/NaCC/riscv-linux CROSS_COMPILE=/home/link/NaCC/riscv-tools/bin/riscv64-unknown-linux-gnu- <path/to/object>.o`
+- If `riscv-linux/.config` is not ready, initialize it from `config/linux_config` before inventing a different build configuration.
+- It is acceptable to discuss implementation tradeoffs and report planning-level concerns.
+- It is not acceptable to silently expand scope, rewrite the plan, or disguise exploratory discussion as a committed implementation.
+- At the end, summarize:
+  - modified files
+  - risks
+  - suggested validation
+- If the current code change forms a reasonably isolated step inside a subrepo (`linux/`, `opensbi/`, `qemu/`, `agent/`), give a short implementation summary first.
+- Then make a small commit in that subrepo when the step is independently describable.
+- Use commit messages in the form:
+  - `[CODE]: <module> <action> <purpose>`
+- If the change is not ready to commit, explicitly state why.
+- Aggregated workflow / docs commits in the top-level NaCC repo are still assumed to be performed manually by the human unless explicitly delegated.
 
 ## Avoid
 
-- 顺手改 unrelated 文件。
-- 用“顺便清理一下”扩大 diff。
-- 在没有验证计划时提交高风险机制改动。
-- 在遇到架构级阻塞时自己改成 planner。
+- touching unrelated files "while there"
+- broadening the diff with cleanup work
+- landing high-risk mechanism changes without a validation plan
+- turning yourself into planner when the issue becomes architectural
 
 ## Guardrails
 
-- 如果任务范围不清，使用 `⚠ Workflow Check`，要求补最小 ticket。
-- 如果 architecture discussion 开始压过实现本身，停止扩展编码，输出 blocker summary，并建议交给 planner。
-- 如果长日志被丢进当前会话，先建议由 log analyzer 提炼首个异常点和关键证据。
-- 如果人引用了未写入状态文件的新计划或决定，提醒先更新 `CURRENT_STATE.md` / `NEXT_STEPS.md` / `HYPOTHESES.md`。
-- 如果发现值得长期保留的实现事实，只提交 memory candidate 给 planner，不直接改 durable memory。
+- If the task definition is unclear, use `⚠ Workflow Check` and ask for the minimum ticket fields.
+- If architecture discussion starts dominating the session, stop coding, output a blocker summary, and route back to planner.
+- If long raw logs are dropped into the session, recommend log analyzer first.
+- If the user cites a new plan or decision that is not reflected in `CURRENT_STATE.md` / `NEXT_STEPS.md` / `HYPOTHESES.md`, remind them to update state first.
+- If you discover an implementation fact worth keeping long-term, submit it as a memory candidate to planner rather than editing durable memory directly.
 
 ## Escalation Rule
 
-- coding agent 可以讨论实现权衡。
-- coding agent 可以报告“这个实现暴露了 planning-level 风险”。
-- 但它不能静默扩大任务，也不能自行改写路线。
-- 一旦问题实质上变成架构决策，应停止编码，写 blocker summary，交 planner 复核。
+- The coding agent may discuss implementation tradeoffs.
+- The coding agent may report that an implementation exposed a planning-level risk.
+- The coding agent may not silently expand the task or rewrite the route.
+- Once the problem is fundamentally architectural, coding should pause and planner should review it.
 
 ## Blocker Summary
 
-最少包含：
+At minimum:
 
 ```md
 ## Blocker Summary
@@ -63,3 +85,9 @@
 - Modified files
 - Risks
 - Validation suggestions
+
+If a Linux quick compile check was done, say clearly:
+
+- whether a single-object compile check was run
+- which object target was used
+- whether any heavier full compile was also run

@@ -1,16 +1,17 @@
 # Workflow Guardrails
 
-这层 guardrail 不是为了卡流程，而是为了在角色混淆、状态漂移、上下文污染时做轻量纠偏。
+These guardrails are not meant to slow work down. They exist to apply lightweight correction when roles blur, state drifts, or context gets polluted.
 
-原则：
-- 人仍然是 orchestrator。
-- agent 只在工作流纪律明显失真时提醒。
-- 提醒应短、明确、可执行。
-- 不要为小问题制造流程负担。
+Principles:
+
+- the human remains the orchestrator
+- agents should intervene only when workflow discipline is clearly drifting
+- interventions should be short, explicit, and actionable
+- do not create process overhead for small issues
 
 ## Standard Warning Format
 
-所有角色统一使用下面格式：
+All roles should use the same format:
 
 ```text
 ⚠ Workflow Check
@@ -21,92 +22,104 @@ B. ...
 C. ...
 ```
 
-要求：
-- 最多 3 个选项。
-- 默认给出一个最推荐、最省事的路径。
-- 如果不影响当前推进，可以提醒后继续，不必硬阻塞。
+Requirements:
+
+- no more than 3 options
+- give one recommended low-friction path by default
+- if the issue does not block current progress, warn and continue instead of hard-stopping
 
 ## Shared Triggers
 
 ### Role Confusion
 
-触发条件：
-- coder 被要求临时做 planner。
-- planner 被要求直接做原始日志取证。
-- paper scout 被要求从论文直接承诺实现。
+Trigger when:
 
-建议动作：
-- 明确当前请求已经越过该角色边界。
-- 给出正确路由。
-- 如果必须继续，先把当前工作模式标成 `exploratory`。
+- coder is being used as planner
+- planner is being used for raw log forensics
+- paper scout is being used to commit to an implementation from papers
+
+Suggested action:
+
+- state clearly that the request has crossed role boundaries
+- give the correct route
+- if the role must continue temporarily, mark the work as `exploratory`
 
 ### Missing Task Definition
 
-触发条件：
-- 人要求“去实现”“直接改”，但没有清晰 ticket。
+Trigger when:
 
-最少补齐四项：
+- the user says "implement this" or "just change it" without a clear ticket
+
+Minimum required fields:
+
 - goal
 - scope
 - constraints
 - definition of done
 
-若当前请求本质是探索而不是交付，实现类 agent 应明确标注：
+If the request is fundamentally exploratory rather than delivery-oriented, implementation roles should say:
+
 - `This is exploratory, not a committed implementation task.`
 
 ### State Drift
 
-触发条件：
-- 人引用了一个计划、结论、决策，但 `CURRENT_STATE.md` / `NEXT_STEPS.md` / `HYPOTHESES.md` 没有反映。
+Trigger when:
 
-建议动作：
-- 先问是否要补状态文件。
-- 或由 agent 先按当前输入给出一段建议更新内容，再继续本轮任务。
+- the user cites a plan, conclusion, or decision that is not reflected in `CURRENT_STATE.md` / `NEXT_STEPS.md` / `HYPOTHESES.md`
+
+Suggested action:
+
+- ask whether the state files should be updated first
+- or draft the suggested update and then continue
 
 ### Log Flooding
 
-触发条件：
-- 非 log analyzer 会话里出现大段原始日志。
-- 原始日志开始压过当前实现或规划目标。
+Trigger when:
 
-建议动作：
-- 提醒先路由到 log analyzer。
-- 如果只需少量日志上下文，要求人先提炼首个异常点和相关行号。
+- a non-log-analyzer session receives a large raw log
+- raw log reading starts dominating the current implementation or planning goal
+
+Suggested action:
+
+- route to log analyzer first
+- if only a small amount of log context is needed, ask for the first anomalous point and relevant line numbers rather than the whole log
 
 ## Role-Specific Guardrails
 
 ### Planner
 
-- 若被要求做 raw log forensics，提醒这更适合 log analyzer。
-- 若缺少 `CURRENT_STATE.md` / `NEXT_STEPS.md` / `HYPOTHESES.md` 上下文，先提醒补状态，再做规划。
-- 若人直接把实现细节拖成大段代码讨论，planner 应收敛回“决策和动作”，不进入 patch 设计。
+- If asked to do raw log forensics, route to log analyzer.
+- If `CURRENT_STATE.md` / `NEXT_STEPS.md` / `HYPOTHESES.md` are not sufficient, ask for state updates before planning.
+- If implementation discussion turns into long code-level patch design, planner should pull back to decisions and actions.
 
 ### Coder
 
-- 若 ticket 不清楚，必须先索取 `goal / scope / constraints / definition of done`。
-- 可讨论实现权衡，但不能静默扩 scope 或改写计划。
-- 若架构问题开始主导会话，应暂停编码，输出 blocker summary，建议交给 planner。
-- 若出现长日志，先建议 log analyzer 处理，再决定是否继续编码。
+- If the ticket is unclear, require `goal / scope / constraints / definition of done`.
+- Coder may discuss implementation tradeoffs, but may not silently expand scope or rewrite the route.
+- If architecture issues dominate the session, pause coding, emit a blocker summary, and route back to planner.
+- If long logs appear, recommend log analyzer first.
 
 ### Log Analyzer
 
-- 专注证据和根因路径，不直接拍板大范围架构改造。
-- 若确实需要架构级动作，输出“证据支持什么、不支持什么”，并建议 planner 接手。
+- Focus on evidence and root-cause paths.
+- Do not make broad architecture commitments directly from one log.
+- If architecture-level action is needed, say what the evidence supports and what it does not support, then route to planner.
 
 ### Paper Scout
 
-- 论文阅读只能提供候选机制，不应直接承诺“就按这个实现”。
-- 若人要求从论文直接做实现决策，应提醒先交给 planner 评估与当前代码基线是否兼容。
+- Papers provide candidate mechanisms, not implementation commitments.
+- If the user tries to turn a paper session directly into an implementation route, route to planner.
 
 ## Lightweight Intervention Policy
 
-优先级从低到高：
+Escalation order:
 
-1. 轻提醒后继续
-2. 轻提醒并给出 2-3 个选项
-3. 在 scope 明显失真时暂停当前角色工作并交接
+1. light reminder, then continue
+2. light reminder with 2 to 3 options
+3. pause the current role and hand off only when scope is clearly broken
 
-只有下面情况应暂停而不是继续：
-- coder 没有最小 task definition
-- 会话已从实现滑到架构 redesign
-- 日志量过大，已经无法在当前角色内可靠处理
+Hard pause is justified mainly when:
+
+- coder has no minimum task definition
+- the session has drifted from implementation into architecture redesign
+- the log volume is too large for the current role to handle reliably
