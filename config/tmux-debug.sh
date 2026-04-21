@@ -1,10 +1,31 @@
 #!/bin/bash
 
+AUTO_CMD="${VM_AUTO_CMD:-${1:-}}"
+GDB_PROMPT_TIMEOUT_SECONDS=30
+
+send_gdb_continue_when_ready() {
+    local gdb_pane=$1
+    local deadline=$((SECONDS + GDB_PROMPT_TIMEOUT_SECONDS))
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if tmux capture-pane -pt "$gdb_pane" -S - 2>/dev/null | grep -Fq "(gdb)"; then
+            tmux send-keys -t "$gdb_pane" "c" C-m
+            return 0
+        fi
+        sleep 1
+    done
+
+    tmux send-keys -t "$gdb_pane" "c" C-m
+}
+
 # Ensure we are in tmux
 if [ -z "$TMUX" ]; then
     echo "Error: You must be running inside tmux to use this feature."
     exit 1
 fi
+
+# Increase history limit for the current session
+tmux set-option -g history-limit 100000
 
 # Record the current (bottom) pane id BEFORE any splits (splits move focus)
 BOTTOM_PANE=$(tmux display-message -p "#{pane_id}")
@@ -25,13 +46,17 @@ tmux select-pane -t "$LEFT_PANE"   -T "nacc-vm"
 tmux select-pane -t "$RIGHT_PANE"  -T "nacc-gdb"
 
 # 4. Setup Top-Left: make vm (Connect to VM)
-tmux send-keys -t "$LEFT_PANE" "make vm" C-m
+VM_CMD="make vm"
+if [ -n "$AUTO_CMD" ]; then
+    printf -v AUTO_CMD_Q "%q" "$AUTO_CMD"
+    VM_CMD+=" VM_AUTO_CMD=$AUTO_CMD_Q"
+fi
+tmux send-keys -t "$LEFT_PANE" "$VM_CMD" C-m
 
 # 5. Setup Top-Right: make gdb (Debugger)
 tmux send-keys -t "$RIGHT_PANE" "make gdb" C-m
-# "Wheelchair" mode: Auto-send 'c' to start execution after a short delay
-# Requires running in background so we can proceed to launch qemu
-(sleep 2; tmux send-keys -t "$RIGHT_PANE" "c" C-m) &
+# Auto-continue only after GDB reaches its prompt; a fixed sleep races detached runs.
+(send_gdb_continue_when_ready "$RIGHT_PANE") &
 
 # 6. Setup Bottom: make launch (QEMU)
 # Switch focus back to bottom pane, then exec into it
@@ -39,4 +64,3 @@ tmux select-pane -t "$BOTTOM_PANE"
 echo "Starting QEMU in bottom pane..."
 clear
 exec make launch DEBUG=1
-
