@@ -275,11 +275,14 @@ def resolve_interp_path(
         candidates.append(candidate)
 
     if os.path.isabs(interp_path):
-        if search_roots:
-            for root in search_roots:
-                add_candidate(root / interp_path.lstrip("/"))
-        else:
-            add_candidate(Path(interp_path))
+        if not search_roots:
+            raise ManifestError(
+                "absolute PT_INTERP path "
+                f"{interp_path!r} from entry {entry_path} requires at least one explicit "
+                "--search-root"
+            )
+        for root in search_roots:
+            add_candidate(root / interp_path.lstrip("/"))
     else:
         add_candidate(entry_path.parent / interp_path)
         for root in search_roots:
