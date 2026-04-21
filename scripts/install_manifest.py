@@ -15,6 +15,7 @@ from pathlib import Path
 GUEST_MANIFEST_PATH = Path("/etc/nacc/manifest.json")
 NBD_DEVICE = "/dev/nbd0"
 NBD_PARTITION = "/dev/nbd0p1"
+QEMU_SYSTEM_NAME = "qemu-system-riscv64"
 
 
 class InstallError(RuntimeError):
@@ -83,28 +84,50 @@ def root_command_prefix() -> list[str]:
     return prefix
 
 
+def read_proc_cmdline(pid: int) -> list[str] | None:
+    try:
+        data = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+
+    if not data:
+        return None
+
+    return [
+        field.decode("utf-8", "surrogateescape")
+        for field in data.split(b"\0")
+        if field
+    ]
+
+
+def read_proc_exe_name(pid: int) -> str | None:
+    try:
+        target = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+    clean_target = target.split(" (deleted)", 1)[0]
+    return Path(clean_target).name
+
+
 def find_qemu_owner(disk_path: Path, repo_root: Path) -> tuple[int, str] | None:
-    completed = run_command(["ps", "-eo", "pid=,args="], capture_output=True)
-    for line in completed.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2:
-            continue
-        pid_str, args = parts
-        if "qemu-system-riscv64" not in args:
+    for proc_entry in Path("/proc").iterdir():
+        if not proc_entry.name.isdigit():
             continue
 
-        try:
-            pid = int(pid_str)
-        except ValueError:
+        pid = int(proc_entry.name)
+        argv = read_proc_cmdline(pid)
+        if not argv:
             continue
 
-        if str(disk_path) in args:
+        if read_proc_exe_name(pid) != QEMU_SYSTEM_NAME:
+            continue
+
+        args = format_command(argv)
+        if any(str(disk_path) in arg for arg in argv[1:]):
             return pid, args
 
-        if disk_path.name not in args:
+        if not any(disk_path.name in arg for arg in argv[1:]):
             continue
 
         try:
