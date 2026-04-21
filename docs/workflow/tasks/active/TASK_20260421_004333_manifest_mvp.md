@@ -1,0 +1,325 @@
+# Task Packet
+
+- Task ID: TASK_20260421_004333_manifest_mvp
+- Created: 2026-04-21 00:43:33 +0800
+- Priority: P0
+- Lane: A
+- Packet Type: execution
+- Owner Role: reviewer
+- Status: needs_review
+- Goal: Deliver Phase 2 minimal manifest-driven startup sealing incrementally so startup protection policy at the post-link / pre-user-entry boundary is derived from a manifest (objects + PT_LOAD segments), not from Linux VMA annotations.
+- Critical Intent: Linux may provide runtime load bases or mapping facts only as coordinates, never as security authority. Phase 2 must be split into small PRs, and the coder should commit after each PR is considered handled. PR3 is runtime-coordinates only: it must report startup object placement facts for the fresh image before first user entry, without reading the manifest, reconstructing manifest ranges, or changing startup protection decisions.
+- Preferred Shape: Land Phase 2 as six small PRs with clean review boundaries and a coder commit after each PR is considered handled. Keep the startup authority split explicit: manifest-derived object/segment facts decide startup sealing intent; Linux runtime reports provide load bases or mapping coordinates only. For PR3 specifically, prefer the smallest Linux + OpenSBI plumbing slice that captures startup-only raw coordinates from the existing ELF exec path and delivers them through the existing Linux->OpenSBI startup path keyed by the current protected root/cid. Prefer role-based runtime facts for the current PR1 object set (`entry` and optional `interp`), with Linux allowed to log extra observability fields such as `AT_ENTRY` or `AT_PHDR` while OpenSBI stores only the raw coordinates needed for later expected-range reconstruction.
+- Disallowed Shape: Do not collapse Phase 2 into one large cross-subsystem landing. Do not keep Linux VMA metadata on the startup security decision path. Do not use manifest information to create de-protection or shared exceptions in this phase. Do not widen scope into syscall-buffer performance tuning, shared apertures, attestation/signing, or a broader runtime-policy redesign. For PR3 specifically, do not parse or read `/etc/nacc/manifest.json`, do not compare runtime coordinates against manifest contents yet, do not emit audit verdicts, do not change leaf-tag decisions, do not add broader runtime-DSO crawling, do not invent a new container-image extraction pipeline, and do not add unrelated kernel-cmdline plumbing just to force `nacc.manifest_mode=audit`.
+- Allowed Freedom: Coder may choose the exact Linux mm-context cache shape, Linux helper boundaries, Linux<->OpenSBI wire format, and OpenSBI storage location for the PR3 runtime report as long as the report stays startup-only and coordinate-only. Coder may log optional Linux-side observability fields such as `AT_ENTRY`, `AT_PHDR`, `bprm->filename`, or `interp_load_addr` if that helps later review, but OpenSBI-side stored state for PR3 should stay limited to raw coordinates needed by later manifest reconstruction for the current PR1 object set. For the first PR3 proof, coder may use the repo's known minimum NACC smoke `docker run --security-opt seccomp=unconfined --rm busybox echo test` rather than widening into a more failure-prone multi-process workload.
+- Scope: Phase 2A/2B MVP only. Include PR0-PR5 as separate incremental landings: logging scaffold, host-side manifest.json generation, guest delivery of manifest.json, runtime load-base report, manifest audit, and monotonic manifest enforcement. Phase 2C items remain future hooks only.
+- Constraints: Do not infer security authority from Linux VMA metadata for startup protection decisions in the target end state. Do not expand scope into syscall-buffer performance work, shared exceptions, de-protection paths, image signature/attestation, or Phase 3 shared aperture work. Manifest use in this phase must be monotonic: it may tighten or audit, but must not relax protection. Unknown ordinary user leaves remain private by default. Keep packet structure intact and deliver as several PRs rather than one large change.
+- Open Semantic Questions: Whether PR4 consumes guest `/etc/nacc/manifest.json` directly or a translated compact table; whether the first workload-matched PR4/PR5 proof target should be a host-visible controlled ELF path or a container-image entry directly if both remain plausible; whether PR5 uses conservative `PRIVATE_DATA` for `MEASURED_RO` or a real RO-protected path if already available.
+- Human Concern: Phase 1 strict-private startup exposed heavy syscall-buffer / usercopy trap cost, but Phase 2 should first remove Linux VMA metadata from the startup trust decision rather than optimize those hot paths prematurely.
+- Key Assumptions: Phase 1 strict private baseline is already accepted. The immediate objective is startup authority cleanup at the post-link / pre-user-entry boundary, not runtime sharing or performance recovery. The user wants a sequence of small PRs, and each handled PR should end with a coder commit before the packet moves on. For PR0 specifically, Linux-side cmdline plumbing plus startup-path logs is sufficient; monitor-side consumption is intentionally deferred because this slice must stay logging-only and preserve the current sealing path unchanged. For PR1 specifically, the minimal generator slice may stop at the entry ELF plus a PT_INTERP-resolved interpreter object, emit `manifest.json` only, and defer compact `manifest.bin` plus broader runtime DSO discovery to later PRs. If PT_INTERP is present but cannot be resolved under the explicit search roots supplied to the generator, including the zero-`--search-root` case for an absolute interpreter path, PR1 treats that as a hard tool error instead of inventing a placeholder manifest object. For PR2 specifically, the smallest safe guest-delivery slice is pre-boot only: take a caller-supplied `manifest.json` unchanged, install it into `NaCC.qcow2` at `/etc/nacc/manifest.json`, and defer any consumer, schema translation, or runtime path discovery to PR3+. The repo's existing `qemu-nbd` + mounted-`rootfs` workflow is the intended delivery mechanism for PR2, and it must not be used while QEMU is running. The PR2 helper may rely on the repo's existing non-interactive root helper convention via `ROOT_SUDO` (default `sudo -n`) plus the repo-owned `/dev/nbd0` + `rootfs` staging slots rather than inventing a new privilege or mount path. For the PR2 SSH readback follow-up, the least invasive harness-safe route is additive: preserve the current banner wait, retry loop, and auto-run SSH path, but require one authenticated `ssh ... true` round trip before declaring the session ready and bound auto-run hangs with explicit timeout logging; `VM_SSH_READY_TIMEOUT_SECONDS` and `VM_SSH_AUTO_TIMEOUT_SECONDS` exist only to relax those new bounds for longer existing flows without changing the default control model. For PR3 specifically, the narrowest route is to capture raw runtime coordinates in the ELF exec path, cache them on the new protected mm, and report them through the existing NaCC startup transition path (`invoke` / `exec` and any exec-built child-reattach path) into OpenSBI-owned state without consuming the manifest yet. The preserved PR2-installed manifest artifact is a transport proof only and does not need to be workload-matched for PR3; the first workload-matched manifest choice is deferred to PR4/PR5.
+- PR3 debug harness assumption: the least invasive follow-up for the pre-auto-run runner failure is to treat it as a paused-debug control-path race, not a new Linux/OpenSBI runtime regression. Evidence is that the runner-owned QEMU log never moved past `[NaCC][qemu-run-start]`, the paired VM pane stayed in the `Waiting for VM (localhost:2222) to operate...` loop, and earlier passing runner flows for the same `make debug` path explicitly recorded a manual `gdb continue` step before boot progressed.
+- PR3 detached rerun cleanliness assumption: reviewer/test_runner should ensure no prior repo-owned `qemu-system-riscv64` instance still holds `NaCC.qcow2` or the forwarded debug/SSH ports before the next fresh detached `make debug` rerun. This coder follow-up makes stale-owner collisions explicit and keeps the `nacc-qemu` pane visible on failure, but it does not auto-kill an existing guest.
+- PR3 pager-state assumption: for this host-harness-only follow-up, the current tmux pane screen is the authoritative source for active GDB interaction state; full pane history may retain stale pager text after GDB resumes, so pager matching must ignore scrollback and tolerate prompt line-wrapping rather than rely on an exact single-line grep of the full history.
+- Evidence / Inference Boundary: The PR0-PR5 route, non-goals, and success criteria in this packet come directly from the human seed in this session, and the human has now explicitly approved treating the runner-owned PR2 evidence as sufficient to continue. Evidence from repository state: `Makefile` already mutates `NaCC.qcow2` through `qemu-nbd` + mounted `rootfs`, `docs/agent/DISK_REPAIR_20260316.md` explicitly warns not to run those write paths while QEMU is still running, `linux/fs/binfmt_elf.c` already computes `load_bias` and `interp_load_addr` before `START_THREAD`, and the current Linux/OpenSBI NaCC plumbing already has startup-only `invoke` / `exec` / `fork` transitions plus region-sync state keyed by root/cid. Planner inference for PR3: the least disruptive next slice is to capture those existing ELF runtime coordinates and forward them to OpenSBI-owned startup state now, while deferring manifest comparison and workload-matched manifest generation to later PRs.
+- Reconciliation Required: no
+- Post-Run Analysis Required: no
+- Human Checkpoint Required: yes
+- Definition Of Done: The task is complete when the work is planned as separate PR-sized increments covering PR0-PR5, with each PR preserving the stated non-goals and monotonicity rules, and with explicit expectation that the coder commits the changes once each PR is handled. Success criteria across the phase are: in audit mode, an end-to-end manifest pipeline produces expected startup segment ranges aligned with runtime mappings without enforcement; in enforce mode, startup protection decisions no longer depend on Linux VMA metadata, PRIVATE_INIT is sealed as PRIVATE_DATA, MEASURED_RO is conservatively protected in MVP, unknown ordinary user leaves remain private by default, and the system still boots/runs.
+- Related State:
+  - `docs/workflow/CURRENT_STATE.md`
+  - `docs/workflow/HYPOTHESES.md`
+  - `docs/workflow/NEXT_STEPS.md`
+- Related Ticket / Plan:
+  - `docs/workflow/tasks/completed/TASK_20260419_115218_private_baseline.md`
+- Branch / Worktree:
+- Validation Tier: T1
+
+## Reference Values
+
+- Priority: `P0` / `P1` / `P2` / `P3`
+- Lane: `A` / `B` / `C`
+- Packet Type: `execution` / `planning` / `analysis`
+- Owner Role: `human` / `planner` / `coder` / `reviewer` / `test_runner` / `log_analyzer`
+- Status: `draft` / `in_progress` / `needs_review` / `changes_requested` / `needs_test` / `needs_analysis` / `test_failed` / `blocked` / `done`
+- Validation Tier: `T0` / `T1` / `T2` / `T3`
+- Reconciliation Required: `yes` / `no`
+- Post-Run Analysis Required: `yes` / `no`
+
+## Required Artifacts
+
+- Patch or commit: one reviewable PR3 change set, likely as a tightly paired Linux/OpenSBI commit set, that adds startup-only runtime-coordinate reporting for the current PR1 object roles (`entry` and optional `interp`) without adding any manifest consumer
+- Minimal compile result: `make opensbi` and `make linux-update`; if coder adds Linux helper-only scaffolding before the full rebuild, preserve any narrower object-compile proof too, but the packet-owned minimum for PR3 is a rebuilt Linux + OpenSBI path because PR3 changes both sides of the startup contract
+- Test command or batch plan: boot a fresh debug run with the known minimum NACC smoke `docker run --security-opt seccomp=unconfined --rm busybox echo test`; preserve runner-owned VM/QEMU logs; confirm the startup path now emits Linux-side runtime-coordinate report lines plus matching OpenSBI-side stored/logged coordinates for the same startup event, and confirm there are still no manifest-audit or enforcement decision lines in this PR3 slice
+- Primary log path: `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_<timestamp>.log`
+- Log path if validation fails: preserve the first failing PR3 build or startup-report artifact, including the first runner-owned VM/QEMU logs if the boot succeeds but the coordinate report is missing or inconsistent
+
+## Latest Summary
+
+- Phase 2 remains the active execution round: startup authority must move from Linux VMA annotations to manifest-derived object/segment facts at the post-link / pre-user-entry boundary, and the work should continue as narrow PR-sized slices rather than one large landing.
+- PR0 is closed:
+  - Linux commit `ee3b3c8504da60c1f2608f59a8e6e4fc684784cc` added `nacc.manifest_mode={off,audit,enforce}` parsing plus startup-only scaffold logs with no intended behavior change.
+  - reviewer approved the PR0 route and test_runner recorded a passing single-object compile proof in `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr0_t1_20260421_005748.log`.
+- PR1 is closed:
+  - implement a host-side minimal manifest generator for the entry ELF plus a PT_INTERP-resolved interpreter object
+  - emit `manifest.json` only in this slice
+  - defer compact `manifest.bin`, guest delivery, runtime load-base reporting, audit logic, and enforcement to later PRs
+- PR1 coder implementation is now ready for review:
+  - top-level commit `7aeca8ef5ee749e32872d24e57405d9ecb3bc90e` (`[CODE]: manifest add minimal host generator`) adds `scripts/generate_manifest.py`, a standalone host-side ELF parser/generator for the entry ELF plus one PT_INTERP-resolved interpreter object
+  - bounded local proof emitted `manifest.json` for a throwaway RISC-V dynamic ELF and resolved `/lib/ld-linux-riscv64-lp64d.so.1` under `riscv-tools/sysroot`; summary log: `logs/coder/TASK_20260421_004333_manifest_mvp_pr1_manifest_smoke_20260421_012505.log`
+- Reviewer found one PR1 fidelity blocker in commit `7aeca8ef5ee749e32872d24e57405d9ecb3bc90e`:
+  - `scripts/generate_manifest.py` still resolves absolute `PT_INTERP` via the host root filesystem when no `--search-root` is supplied, so PR1 must return to coder for a narrow fail-closed resolver fix before test handoff
+- Coder repaired the PR1 fidelity blocker in follow-up commit `4a30e9c85912cf53480255a694119b29b76ab3b8` (`[CODE]: manifest fail closed implicit interp root`):
+  - `scripts/generate_manifest.py` now treats an absolute `PT_INTERP` with no explicit `--search-root` as a hard tool error instead of probing the host root filesystem
+  - refreshed bounded proofs now include a positive explicit-sysroot manifest emission at `logs/coder/TASK_20260421_004333_manifest_mvp_pr1_manifest_smoke_20260421_111813.log` and a negative fail-closed proof at `logs/coder/TASK_20260421_004333_manifest_mvp_pr1_failclosed_20260421_111849.log`
+- Reviewer re-check approved the repaired PR1 route for test handoff:
+  - direct reviewer checks on the current `scripts/generate_manifest.py` reproduced `python3 -m py_compile`, a positive explicit-sysroot generation for `/tmp/nacc_manifest_smoke_20260421_111813.elf`, and a negative fail-closed `/bin/ls` run with no `--search-root`
+  - no new fidelity or risk blocker was found beyond intentionally deferred PR1 scope limits such as broader runtime DSO discovery and later guest/monitor plumbing
+- Test runner independently reran the bounded PR1 T1 checks and recorded a passing runner-owned artifact set:
+  - `python3 -m py_compile scripts/generate_manifest.py` passed
+  - explicit-sysroot generation passed and wrote `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr1_t1_20260421_113715.manifest.json` with `schema=nacc-manifest-v1alpha1`, `roles=entry,interp`, and interpreter resolution under `/home/link/NaCC/riscv-tools/sysroot`
+  - the no-`--search-root` `/bin/ls` negative case failed closed with exit `1` and produced no output file; summary log: `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr1_t1_20260421_113715.log`
+- Human approved PR1 closeout after reviewing the changes and explicitly requested that continuation stay on this execution packet instead of opening a separate lane-B planning packet.
+- Human checkpoints are restored for PR boundaries on this packet: keep automatic machine-to-machine flow inside a PR, but when a PR-sized slice is intentionally parked with `Next owner: human`, organizer should pause for explicit human continuation.
+- PR2 was the active slice:
+  - deliver a caller-supplied `manifest.json` into `NaCC.qcow2` at fixed guest path `/etc/nacc/manifest.json`
+  - reuse the existing pre-boot `qemu-nbd` + mounted-`rootfs` workflow already used for other image updates; do not mutate the qcow2 while QEMU is running
+  - keep this PR behavior-neutral: no Linux/OpenSBI/agent consumer, no schema change, no `manifest.bin`, no runtime `scp`/`ssh`/9p/virtiofs delivery path, and no runtime load-base reporting
+  - validation target for PR2 is bounded: a host-generated manifest is installed, the guest boots, and the guest-visible file at `/etc/nacc/manifest.json` matches the host artifact by hash and/or bounded content readback
+- PR2 coder implementation is now ready for review:
+  - top-level commit `261971b58ff653c6e1818fe4cd28af4c1691037e` (`[CODE]: manifest add guest delivery helper`) adds `scripts/install_manifest.py`, a standalone pre-boot host-side installer for `/etc/nacc/manifest.json`
+  - the helper reuses the repo's `qemu-nbd` + mounted-`rootfs` flow, refuses to proceed when a live `qemu-system-riscv64` still appears to own `NaCC.qcow2`, copies a caller-supplied manifest unchanged to the fixed guest path, and compares the source and installed guest file by SHA-256 before cleanup
+  - bounded local artifacts for this slice are `logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json`, `logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.log`, and the current-host privilege blocker capture `logs/coder/TASK_20260421_004333_manifest_mvp_pr2_install_blocked_host_20260421_134432.log`
+  - direct live qcow2 mutation could not be completed on this host because the repo-aligned `ROOT_SUDO` default (`sudo -n`) lacks passwordless privilege here; the preserved blocker log records `sudo -n modprobe nbd max_part=16` failing with `sudo: a password is required`
+- Reviewer approved PR2 for bounded test handoff:
+  - direct code review confirmed that commit `261971b58ff653c6e1818fe4cd28af4c1691037e` adds only `scripts/install_manifest.py`, keeps Linux/OpenSBI/agent untouched, reuses the repo-owned `ROOT_SUDO` + `qemu-nbd` + mounted-`rootfs` path, and keeps `/etc/nacc/manifest.json` as the fixed guest destination
+  - direct reviewer reruns reproduced `python3 -m py_compile scripts/install_manifest.py`, and a live invocation failed early before disk mutation in the current sandbox because root escalation is unavailable here; no PR2 fidelity or code-level risk blocker was found
+- Log analysis classified the first PR2 T1 install blocker as a false-positive live-QEMU owner match:
+  - runner log `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_153035.log` shows the rejected pid command line begins `node /usr/bin/codex -C /home/link/NaCC ...`, not a real `qemu-system-riscv64` launch
+  - `scripts/install_manifest.py:86-116` matches any process whose full `ps` args merely contain `qemu-system-riscv64` and `NaCC.qcow2` text plus a repo-root cwd, which allowed prompt-carrying Codex worker text to satisfy the guard
+  - the failure occurred before `modprobe`, `qemu-nbd -c`, or `mount`, so no qcow2 mutation or guest boot was attempted in the runner-owned pass
+- Coder repaired the PR2 live-QEMU guard in follow-up commit `7fa1a4e660552df2f7ce90b8a407cc441d5aad71` (`[CODE]: manifest tighten qemu owner detection`):
+  - `scripts/install_manifest.py` now inspects `/proc` directly and only treats a pid as a live guest owner when `/proc/<pid>/exe` identifies a real `qemu-system-riscv64` executable; the existing disk-path and repo-cwd heuristics run only after that positive identity check
+  - bounded local guard proof in `logs/coder/TASK_20260421_004333_manifest_mvp_pr2_guard_sanity_20260421_153746.log` shows a non-QEMU python process carrying `qemu-system-riscv64` plus `NaCC.qcow2` text is ignored, while a minimal paused real QEMU process referencing `NaCC.qcow2` is still detected
+  - bounded local recheck `logs/coder/TASK_20260421_004333_manifest_mvp_pr2_guard_fix_install_blocked_host_20260421_153746.log` now reaches the known host privilege blocker at `sudo -n modprobe ...` instead of failing at the stale false-positive owner guard
+- Reviewer re-check approved the PR2 live-QEMU guard repair for renewed bounded test handoff:
+  - direct review of commit `7fa1a4e660552df2f7ce90b8a407cc441d5aad71` confirmed the diff stays inside `scripts/install_manifest.py` and keeps the PR2 route delivery-only, with no Linux/OpenSBI/agent or manifest-consumer change
+  - direct reviewer reruns reproduced `python3 -m py_compile scripts/install_manifest.py`, and a live invocation now reaches the expected local `sudo -n modprobe ...` privilege blocker instead of the stale false-positive owner trap
+  - direct code checks against `Makefile:289` and `Makefile:334` confirmed the repo's standard launch path still execs `qemu-system-riscv64` directly, so the new `/proc/<pid>/exe` identity rule fits the intended control model for PR2 validation
+- Test runner reran the bounded PR2 T1 loop after the guard fix and hit the expected host privilege boundary:
+  - `python3 -m py_compile scripts/install_manifest.py` passed
+  - `sha256sum logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` matched the packet expectation `010a63ae4059068f55daa6734e601c2f2c709b1f2de699e65fbc9e09f7fb2a30`
+  - `python3 scripts/install_manifest.py logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` failed at `sudo -n modprobe nbd max_part=16` with `sudo: a password is required`, so the run stopped before `qemu-nbd -c`, `mount`, guest boot, or logger
+  - runner-owned primary log: `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_154938.log`
+  - post-failure cleanliness checks in the same runner log show `rootfs` was not mounted and `/dev/nbd0` was not present after the failed install attempt
+- PR2 remains blocked on host execution privilege rather than code behavior:
+  - the current validating host still lacks passwordless `ROOT_SUDO` access for the repo-owned pre-boot `qemu-nbd` workflow
+  - guest boot plus `/etc/nacc/manifest.json` readback is still pending on a root-capable host and remains the next required evidence before PR2 can close
+- Test runner retried the same bounded PR2 T1 loop after the user indicated sudo access might be updated:
+  - `python3 -m py_compile scripts/install_manifest.py` passed again
+  - `sha256sum logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` still matched `010a63ae4059068f55daa6734e601c2f2c709b1f2de699e65fbc9e09f7fb2a30`
+  - `python3 scripts/install_manifest.py logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` still failed immediately at `sudo -n modprobe nbd max_part=16` with `sudo: a password is required`
+  - runner-owned retry log: `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_162645.log`
+  - cleanup checks in the retry log again show `rootfs` not mounted and `/dev/nbd0` absent after the failed attempt
+- Test runner reran the bounded PR2 T1 loop after `sudo -n` access was fixed and reached the guest-readback stage:
+  - `python3 -m py_compile scripts/install_manifest.py` passed again
+  - `sha256sum logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` still matched `010a63ae4059068f55daa6734e601c2f2c709b1f2de699e65fbc9e09f7fb2a30`
+  - `python3 scripts/install_manifest.py logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` succeeded and reported installation to guest path `/etc/nacc/manifest.json`
+  - runner launched a fresh tmux debug session, manually sent one `gdb` `c` after the session came up so the paused `-S -s` debug launch would run, and waited through the packet-owned guest-readback window after `[NaCC] Auto-running: ...`
+  - the guest boot reached SSH auto-run, but no guest-visible `sha256sum /etc/nacc/manifest.json` output and no manifest `schema` or `role` readback appeared within the bounded wait window
+  - runner-owned primary log: `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_164341.log`
+  - runner-owned guest/QEMU artifacts: `logs/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_164341_vm_20260421_164945.log` and `logs/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_164341_qemu_20260421_164945.log`
+  - runner cleaned the dedicated tmux session and confirmed `qemu_process_count_after_kill=0`
+- Log analysis classified the latest PR2 readback failure as a host-side SSH auto-run/session boundary failure, not a manifest install failure:
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_164341.log` shows install success, `auto_running_seen=1`, `digest_seen=0`, `schema_or_role_seen=0`, and no VM-side error match before cleanup
+  - `logs/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_164341_vm_20260421_164945.log` and `logs/live_vm_pane_182.log` both stop immediately after the SSH host-key warning, with no manifest hash, no schema/role output, no retry message, and no shell prompt return
+  - `logs/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_164341_qemu_20260421_164945.log` shows normal boot through serial login readiness and no obvious guest crash or manifest-related kernel fault in the captured window
+  - repository evidence in `config/vm_link.sh` shows the VM readiness gate only waits for an SSH banner on `localhost:2222` before it immediately launches `sshpass -p riscv ssh -tt ... "$AUTO_CMD"`, so the first observed bad boundary is after banner detection and before first remote command output
+- Coder implemented the requested PR2 SSH harness follow-up in commit `b46309c4aac2f7015d4139a65ef038011afc12f2` (`[CODE]: vm link probe authenticated ssh`):
+  - `config/vm_link.sh` keeps the existing banner wait, `sshpass` fallback, retry-on-255 loop, and auto-run path intact, but adds an authenticated readiness probe that loops on `ssh ... true` before the script trusts the SSH session as usable
+  - the same file now bounds auto-run hangs with explicit `[NaCC][ssh-auto-timeout]` / `[NaCC][ssh-auto-exit]` logging so reviewer/test_runner can distinguish session stalls from remote command failure without guessing from a silent pane
+  - to avoid hard-breaking longer pre-existing manual or batch flows, the new bounds are minimally overridable through `VM_SSH_READY_TIMEOUT_SECONDS` and `VM_SSH_AUTO_TIMEOUT_SECONDS`; default behavior stays on the same `vm_link.sh` control path
+- Bounded coder validation for the SSH follow-up stayed host-side and syntax-only:
+  - `bash -n config/vm_link.sh` passed with preserved log `logs/coder/TASK_20260421_004333_manifest_mvp_pr2_vm_link_syntax_20260421_170108.log`
+  - live guest install/boot/readback remains runner-owned because this turn intentionally changed only the host-side readback harness and did not rerun the packet's full T1 loop locally
+- Reviewer approved the PR2 SSH follow-up for renewed bounded test handoff:
+  - direct review of commit `b46309c4aac2f7015d4139a65ef038011afc12f2` confirmed the diff stays inside `config/vm_link.sh` and preserves the standard `make debug -> make vm -> ./config/vm_link.sh` control path used for PR2 readback
+  - `config/vm_link.sh` now adds only the packet-requested authenticated `ssh ... true` readiness probe plus `[NaCC][ssh-ready{-timeout}]` and `[NaCC][ssh-auto-{timeout,exit}]` diagnostics, while leaving the existing banner wait and retry-on-255 loop in place
+  - direct reviewer rechecks reproduced `bash -n config/vm_link.sh`; no new PR2 fidelity or code-level risk blocker was found, though runner should keep validation on the standard `sshpass`-backed flow and only relax the new timeout knobs if the bounded command legitimately needs more time
+- Test runner reran the bounded PR2 T1 loop after the SSH probe follow-up and recorded runner-owned in-guest readback proof:
+  - `bash -n config/vm_link.sh` passed and `python3 -m py_compile scripts/install_manifest.py` passed
+  - `sha256sum logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` still matched `010a63ae4059068f55daa6734e601c2f2c709b1f2de699e65fbc9e09f7fb2a30`
+  - `python3 scripts/install_manifest.py logs/coder/TASK_20260421_004333_manifest_mvp_pr2_manifest_source_20260421_134432.json` succeeded and left `rootfs` unmounted afterward
+  - the standard `make debug VM_AUTO_CMD='sha256sum /etc/nacc/manifest.json; grep -E "\"schema\"|\"role\"" /etc/nacc/manifest.json || true; test -f /etc/nacc/manifest.json'` flow reached guest auto-run, the primary runner log recorded `auto_exit_code=0`, and the paired VM log captured guest-visible digest `010a63ae4059068f55daa6734e601c2f2c709b1f2de699e65fbc9e09f7fb2a30  /etc/nacc/manifest.json`
+  - direct post-run cleanup checks found no live `qemu-system-riscv64` process, `rootfs` not mounted, `/dev/nbd0` present only as a detached `0B` device node, and no `/dev/nbd0p1`
+- Human inspected the current PR2 evidence in-session and approved continuation:
+  - PR2 guest delivery may now be treated as closed on this packet
+  - continuation should stay on this same execution packet and move directly to the next bounded PR-sized slice
+- PR3 is now the active slice:
+  - add the smallest startup-only runtime-coordinate report for the fresh image before first user entry
+  - Linux may report raw coordinates, but they remain coordinates only; OpenSBI may store/log them, but must not yet compare them against the manifest
+  - keep this PR scoped to the current PR1 object set (`entry` and optional `interp`) and to existing startup transitions; do not widen into manifest parsing, audit verdicts, or enforcement
+  - the preserved PR2-installed manifest remains a delivery proof only in this slice; workload-matched manifest selection is deferred to PR4/PR5
+- PR3 coder implementation is now ready for review:
+  - Linux commit `00b914f9fde454dd580aec23bb98ccea46d13a21` (`[CODE]: riscv nacc report startup runtime coords`) adds startup-coordinate cache/report plumbing across `fs/binfmt_elf.c`, `arch/riscv/mm/nacc.c`, `arch/riscv/kernel/sys_riscv.c`, and the RISC-V NaCC/mmu/SBI headers
+  - OpenSBI commit `7749352da4b272260677179b960702351f7c7e86` (`[CODE]: sm store startup runtime coords`) adds the role-based startup-coordinate store/log path across `include/sm/region.h`, `include/sm/sm.h`, `lib/sbi/sbi_ecall_nacc.c`, `lib/sbi/sm/region.c`, and `lib/sbi/sm/sm.c`
+  - route chosen: Linux caches `entry_load_bias`, `interp_load_addr`, `AT_ENTRY`, and `AT_PHDR` on the fresh exec `mm` in `load_elf_binary()`, using an explicit `interp_present` boolean rather than inferring interpreter absence from `interp_load_addr == 0`; Linux then reports only role-tagged raw runtime bases for `entry` and optional `interp` through a new `SBI_EXT_NACC_STARTUP_COORD` call on the existing startup transitions `nacc_invoke`, `nacc_exec`, and `nacc_invoke_child`
+  - OpenSBI stores only `startup_coord_valid_mask`, `startup_entry_load_bias`, and `startup_interp_load_addr` per authorized root/cid, and its logs state explicitly that PR3 is coordinates-only with no startup policy change
+- Bounded coder build proof for PR3:
+  - `make opensbi` passed with preserved log `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_make_opensbi_20260421_232805.log`
+  - Linux kernel image rebuild passed with preserved log `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_linux_build_20260421_230143.log`
+  - `make final-image` passed with preserved log `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_final_image_20260421_230616.log`
+  - `make linux-update` was attempted in-sandbox and escalated; in both cases the kernel/modules build completed through module install, but the final `modules-update-wrapper` step failed for operational reasons rather than code compile failure: first because sandboxed `sudo` was blocked (`logs/coder/TASK_20260421_004333_manifest_mvp_pr3_make_linux_update_20260421_232805.log`), then because a coder-owned debug QEMU still held `NaCC.qcow2` during the escalated rerun (`logs/coder/TASK_20260421_004333_manifest_mvp_pr3_make_linux_update_escalated_20260422_000124.log`)
+- Bounded coder runtime attempt for PR3:
+  - the first local smoke launch hit a stale paused `make debug` / QEMU owner from `17:13`, preserved in `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_runtime_qemu_20260421_233444.log`; coder explicitly inspected and cleared that stale owner before retrying
+  - a fresh standard `make debug VM_AUTO_CMD='docker run --security-opt seccomp=unconfined --rm busybox echo test'` session reached authenticated SSH readiness and auto-run start, preserved in `logs/live_vm_pane_234.log`
+  - direct SSH probe to the same forwarded guest succeeded after sandbox escalation, but two exact smoke attempts preserved in `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_runtime_ssh_smoke_20260421_234703.log` and `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_runtime_ssh_smoke_retry_20260421_234703.log` both failed because the guest Docker daemon was not yet ready, so coder did not obtain a reviewer-ready Linux/OpenSBI coordinate-log pair in this turn
+- Reviewer approved PR3 for bounded test handoff:
+  - direct code review confirmed that `linux/fs/binfmt_elf.c` caches fresh-image coordinates from the existing ELF exec path, `linux/arch/riscv/kernel/sys_riscv.c` reports only role-tagged raw bases on the existing startup transitions `nacc_invoke`, `nacc_exec`, and `nacc_invoke_child`, and `opensbi/lib/sbi/sm/region.c` stores only the authorized `entry` / `interp` runtime bases plus a valid-mask per root/cid
+  - direct reviewer checks found no manifest read/parse/compare path, no audit verdict path, no new leaf-tag decision path, and no startup-policy drift in this slice; the remaining work is runner-owned runtime evidence that the Linux/OpenSBI coordinate logs appear together on a fresh startup event
+- Test runner executed the bounded PR3 T1 loop on `2026-04-22` and stopped at the first runner-owned failing runtime artifact:
+  - `make opensbi` passed with runner-owned log `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_make_opensbi_20260422_002416.log`
+  - `make linux-update` passed with runner-owned log `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_make_linux_update_20260422_002416.log`
+  - a fresh detached standard `make debug VM_AUTO_CMD='docker run --security-opt seccomp=unconfined --rm busybox echo test'` run never reached `[NaCC] Auto-running:` within the bounded wait, so the packet stopped before PR3 coordinate verification
+  - runner-owned primary log: `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_002416.log`
+  - runner-owned runtime artifacts: `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_002416_vm_20260422_003713.log` and `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_002416_qemu_20260422_003713.log`
+- Coder inspected the runner-owned PR3 stall and classified it as a host debug auto-continue race rather than a fresh PR3 runtime regression:
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_002416.log` records no manual `gdb continue` action, unlike earlier passing runner flows such as `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_163626.log`
+  - the paired runner-owned VM/QEMU artifacts show the exact paused-debug signature for this repo path: VM side never leaves the SSH wait loop and QEMU side never prints beyond `[NaCC][qemu-run-start]`
+- Coder repaired the PR3 pre-auto-run stall in follow-up commit `3088363bda30efc7f43cdd9d50fe76245c3b669e` (`[CODE]: debug wait for gdb prompt before continue`):
+  - `config/tmux-debug.sh` now waits until the `nacc-gdb` pane reaches a real `(gdb)` prompt before sending the existing `c`, instead of racing a fixed `sleep 2`
+  - the fix stays on the existing `make debug -> config/tmux-debug.sh -> make gdb / make launch DEBUG=1` control path and does not change Linux/OpenSBI PR3 logic, manifest handling, or startup policy
+  - bounded sanity logs for this harness-only follow-up are `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_004452.log` and `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_004452.log`
+- Reviewer approved the PR3 harness follow-up for renewed bounded test handoff:
+  - direct review of commit `3088363bda30efc7f43cdd9d50fe76245c3b669e` confirmed the needed change remains in `config/tmux-debug.sh`: the script still launches the same three panes, still starts QEMU under `-S -s`, and still auto-sends a single `c`, but now waits for a real `(gdb)` prompt before sending it
+  - direct reviewer checks matched the paused-debug diagnosis against the failing runner artifacts `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_002416.log`, `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_002416_vm_20260422_003713.log`, and `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_002416_qemu_20260422_003713.log`, and reproduced `bash -n config/tmux-debug.sh` plus `git diff --check` on the follow-up diff
+  - no new fidelity or code-level risk blocker was found; the remaining work is a fresh runner-owned PR3 T1 rerun on the standard `make debug` path without manual `gdb continue` injection on the first pass
+- Test runner executed the renewed PR3 T1 rerun on `2026-04-22` and stopped at the first fresh runner-owned failing artifact after the harness follow-up:
+  - no packet-owned rebuilds were rerun on this pass; `linux/`, `opensbi/`, and `qemu/` were clean in direct runner checks, while the active handoff change remained the host-side `config/tmux-debug.sh` follow-up already reviewed for this rerun
+  - fresh detached session `tr_pr3_20260422_005709` created `nacc-vm` and `nacc-gdb` panes, but no live `nacc-qemu` pane appeared in the bounded startup wait
+  - runner-owned VM log `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_vm_20260422_010417.log` never reached `[NaCC] Auto-running: ...`
+  - runner-owned logger artifact `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_qemu_20260422_010417.log` contains no `[NaCC][qemu-run-start]` marker for this pass, and direct runner captures preserved the paired GDB pane plus pane inventory in `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log` and `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_panes_20260422_010448.log`
+  - runner-owned primary log: `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709.log`
+- Coder reproduced the fresh detached-session failure locally on the host harness path without rerunning the full packet loop:
+  - a bounded detached probe `make debug VM_AUTO_CMD='echo probe'` reproduced the same two-pane state with no live `nacc-qemu` pane
+  - a direct bounded `timeout 5 make launch DEBUG=1` showed the immediate launch failure `Failed to get "write" lock` on `NaCC.qcow2`, proving the missing pane was caused by a fast QEMU exit rather than a silent tmux split failure
+  - `lsof /home/link/NaCC/NaCC.qcow2` and `ss -ltnp` confirmed a live real `qemu-system-riscv64` owner (`pid 3703684`) still held `NaCC.qcow2` plus ports `2222` and `1234`
+  - tmux pane inventory also showed a live repo debug session `tr_pr3_20260422_005356` still carrying `nacc-qemu`, so the first fresh boundary is now classified as a stale-owner collision on the host debug path
+- Coder implemented the next narrow PR3 harness follow-up in commit `65df34b0cece1343fadf9c0426a2c7298a7d5df8` (`[CODE]: debug guard stale qemu owner`):
+  - `config/tmux-debug.sh` now sets the bottom pane title early and enables `remain-on-exit` so immediate launch failures preserve a visible `nacc-qemu` pane instead of collapsing to a missing-pane artifact
+  - the same file now scans `/proc` for a real `qemu-system-riscv64` owner of `NaCC.qcow2` before splitting/launching, and emits explicit `[NaCC][qemu-owner-block]` lines with the owning pid/command when the disk is still busy
+  - the GDB helper in the same file now steps through the startup pager prompt (`--Type <RET>...`) before waiting for `(gdb)`, so the later auto-continue still sends the actual inferior `c` on a clean host
+  - bounded coder sanity for this follow-up is preserved in `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_011516.log`, `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_011516.log`, `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_owner_guard_20260422_011516.log`, and `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_owner_guard_panes_20260422_011516.log`
+- Reviewer found one narrow PR3 harness fidelity blocker in commit `65df34b0cece1343fadf9c0426a2c7298a7d5df8`:
+  - the stale-owner guard and early `nacc-qemu` pane preservation stay within the intended host debug control path, but the new pager matcher in `config/tmux-debug.sh` does not actually detect the GDB pager prompt
+  - direct reviewer rerun of `printf '%s\n' "$GDB_PAGER_PROMPT" | grep -Fq "$GDB_PAGER_PROMPT"` exits `2` with `grep: unrecognized option '--Type <RET> ...'` because the pattern begins with `--Type`, and the real pane capture in `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log` also shows the pager prompt wrapped across lines, so the current exact single-line match is not robust
+  - because this follow-up explicitly claimed to fix both the stale-QEMU-owner collision and the GDB pager edge before the next runner-owned rerun, the broken pager path is treated as a spec-fidelity blocker rather than a style nit
+- Coder repaired the narrow PR3 pager-path fidelity blocker in a host-harness-only follow-up to `config/tmux-debug.sh`:
+  - `send_gdb_continue_when_ready()` now inspects only the current tmux pane screen instead of full scrollback, so stale pager text from earlier screen state does not keep matching after GDB resumes
+  - the helper now compacts whitespace before matching `--Type <RET> for more, q to quit, c to continue without paging--`, which makes the real wrapped pane shape in `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log` match reliably without treating the prompt as a `grep` option
+  - the helper now prefers a visible `(gdb)` prompt over any residual pager text, so a prompt-bearing screen still sends the intended inferior `c` instead of looping on raw pager clears
+  - bounded coder sanity for this repair is preserved in `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_013318.log`, `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_013318.log`, and `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_pager_mock_20260422_013402.log`
+
+## Next Handoff
+
+- Next owner: reviewer
+- Trigger: coder repaired the pager matcher in `config/tmux-debug.sh` and added bounded proof against the real runner-captured GDB pane shape; reviewer should recheck this harness-only follow-up before another runner-owned PR3 T1 rerun.
+- Exact artifact to read first: `config/tmux-debug.sh`
+- Exact task for next owner: confirm that `send_gdb_continue_when_ready()` now stays within the existing `make debug -> config/tmux-debug.sh -> make gdb / make launch DEBUG=1` control model while matching the wrapped pager prompt from `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log`; if that recheck passes, hand the same standard PR3 T1 runtime command back to test_runner.
+- Expected deliverable: reviewer decision plus, if approved, a renewed reviewer-to-test_runner handoff for `make debug VM_AUTO_CMD='docker run --security-opt seccomp=unconfined --rm busybox echo test'` on a clean host.
+- Stop condition: stop after reviewer recheck for this host-harness-only repair; do not widen into PR4 audit or PR5 enforcement work.
+- If blocked: preserve the first remaining harness fidelity blocker in the packet and route narrowly. If a real fix would require changing the `make debug` control model rather than repairing the current harness logic, escalate instead of guessing.
+- Do not do in this turn: do not manually type `c` into GDB on the first rerun, do not widen into manifest parsing/comparison, do not reopen PR2 delivery, do not add auto-kill behavior for stale guests, and do not spend the turn on unrelated runtime-policy work.
+
+## Coder Result
+
+- Implementation summary:
+  - Patched only `config/tmux-debug.sh` on top of the accepted stale-owner guard follow-up so `send_gdb_continue_when_ready()` now reads the current tmux pane screen instead of full scrollback, compacts whitespace before pager matching, and prefers a visible `(gdb)` prompt over any residual pager text.
+  - The new pager matcher is shaped directly against the real runner artifact `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log`, where `--Type <RET> for more, q to quit, c to continue without paging--` is wrapped across lines.
+  - Left the PR3 Linux/OpenSBI coordinate-report implementation unchanged:
+    - Linux commit `00b914f9fde454dd580aec23bb98ccea46d13a21` (`[CODE]: riscv nacc report startup runtime coords`)
+    - OpenSBI commit `7749352da4b272260677179b960702351f7c7e86` (`[CODE]: sm store startup runtime coords`)
+- Commit or patch:
+  - current handoff patch in `config/tmux-debug.sh` plus packet/report updates, committed in this turn as `[CODE]: debug detect wrapped gdb pager`
+  - `65df34b0cece1343fadf9c0426a2c7298a7d5df8` `[CODE]: debug guard stale qemu owner`
+  - `3088363bda30efc7f43cdd9d50fe76245c3b669e` `[CODE]: debug wait for gdb prompt before continue`
+  - `00b914f9fde454dd580aec23bb98ccea46d13a21` `[CODE]: riscv nacc report startup runtime coords`
+  - `7749352da4b272260677179b960702351f7c7e86` `[CODE]: sm store startup runtime coords`
+  - packet/report handoff update in `docs/workflow/tasks/active/TASK_20260421_004333_manifest_mvp.md` and `docs/workflow/tasks/reports/active/TASK_20260421_004333_manifest_mvp_human_report.md`
+- Route chosen and why:
+  - Kept the fix entirely on the host debug control path because the open blocker was still pre-boot harness behavior, not PR3 Linux/OpenSBI runtime-coordinate logic.
+  - Repaired the matcher against the real pane artifact instead of inventing a new launch or lifecycle model: visible pane state now drives the interaction decision, wrapped pager whitespace is normalized, and prompt detection wins if both prompt and stale pager text are visible together.
+  - Preserved the existing `make debug` flow on a clean host: the repo still launches the same QEMU under `-S -s`, still starts the same `make vm` and `make gdb` panes, and still auto-sends one continue.
+- Escalations made:
+  - none in this follow-up
+- Minimal validation:
+  - `bash -n config/tmux-debug.sh` passed; preserved log: `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_013318.log`
+  - `git diff --check -- config/tmux-debug.sh` passed; preserved log: `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_013318.log`
+  - bounded mock proof drove `send_gdb_continue_when_ready()` with the exact runner-captured wrapped pager pane on the first capture and a prompt-bearing capture on the second; it recorded the intended `tmux send-keys` sequence `c` then `c`+Enter and passed all assertions. Preserved log: `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_pager_mock_20260422_013402.log`
+- Remaining risks:
+  - reviewer should confirm that the new visible-pane assumption matches the repo’s current tmux/GDB behavior closely enough and that the stale-owner guard plus `remain-on-exit` behavior still stay within the intended host harness control model
+  - reviewer/test_runner still need a fresh standard debug rerun with pane capture so the Linux/OpenSBI PR3 coordinate lines can finally be verified on a boot that passes the pre-auto-run boundary
+  - this turn did not launch a fresh VM/QEMU runtime loop; the next rerun still depends on the explicit packet assumption that the host is clean of prior repo-owned QEMU holders before launching a fresh detached debug session
+
+## Review Result
+
+- Approval status: pending reviewer recheck
+- Spec fidelity: pending reviewer recheck after the coder repaired pager detection in `config/tmux-debug.sh`. The current patch stays on the intended PR3 host-harness route, preserves the existing `make debug -> config/tmux-debug.sh -> make gdb / make launch DEBUG=1` control model, and does not change Linux/OpenSBI runtime-coordinate logic, manifest handling, startup policy, or guest lifecycle management.
+- Risk review: the visible-pane / compact-whitespace matcher is intentionally narrower than the prior full-history grep path, but reviewer should still confirm that the repo’s current tmux/GDB output shape matches this assumption closely enough before another runner-owned cycle is spent.
+- Can proceed to test: pending reviewer decision
+- Key files to review:
+  - `docs/workflow/tasks/active/TASK_20260421_004333_manifest_mvp.md`
+  - `docs/workflow/CURRENT_STATE.md`
+  - `config/tmux-debug.sh`
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709.log`
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log`
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_panes_20260422_010448.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_013318.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_013318.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_pager_mock_20260422_013402.log`
+- Short human-facing code explanation: this follow-up keeps the accepted stale-owner guard path intact and only repairs the GDB pager matcher so it works on the real wrapped pane shape. It still does not touch manifest use or the Linux/OpenSBI startup-coordinate path.
+- Why the route still fits: the packet explicitly allows narrow host-harness follow-ups when the failure happens before PR3 Linux/OpenSBI code executes, and this repair only fixes how the existing harness distinguishes a wrapped pager prompt from a real `(gdb)` prompt.
+- Human-facing summary: reviewer should recheck the harness-only pager repair; if it passes, the next move is the same runner-owned PR3 T1 rerun.
+
+## Test Result
+
+- Command run:
+  - no new reviewer/test-runner runtime command has been executed for this pager-repair follow-up
+- Build actions:
+  - coder limited this follow-up to host-side sanity only (`bash -n`, `git diff --check`, and a bounded mock proof of the pager path)
+- Outcome:
+  - pending_reviewer_recheck
+- Primary log path:
+  - next runner-owned primary log should be `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_<timestamp>.log`
+- Artifact / log path:
+  - current coder sanity artifacts are `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_013318.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_013318.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_pager_mock_20260422_013402.log`
+- Cleanup state:
+  - no new packet-owned tmux/QEMU/VM runtime loop was performed in this follow-up
+
+## Analysis Result
+
+- Post-run analysis required:
+  - no
+- Verdict:
+  - coder_completed_narrow_harness_fix_pending_reviewer
+- Human-facing summary:
+  - The host-side stale-owner diagnosis still stands, and this turn repairs the remaining pager matcher by using visible pane state plus whitespace-tolerant prompt matching against the real runner capture. The next step is reviewer recheck, not a broader redesign.
+- Recommended next owner:
+  - reviewer
+- Recommended next step:
+  - review `config/tmux-debug.sh` against the real runner GDB pane capture and the new bounded mock proof; if approved, hand the same standard PR3 T1 command back to test_runner on a clean host
+- Exact review artifacts:
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709.log`
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log`
+  - `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_panes_20260422_010448.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_013318.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_013318.log`
+  - `logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_pager_mock_20260422_013402.log`
+  - `config/tmux-debug.sh`
+
+## Open Questions
+
+- Should PR4 consume guest `/etc/nacc/manifest.json` directly, or should it introduce a translated compact table at that point?
+- Should the first workload-matched PR4/PR5 proof target be a host-visible controlled ELF path or a container-image entry directly if both remain plausible?
+- For PR5 MVP, if real RO enforcement is not already available on the chosen path, is conservative `MEASURED_RO -> PRIVATE_DATA` the accepted first landing?

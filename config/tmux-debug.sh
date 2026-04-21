@@ -3,6 +3,7 @@
 AUTO_CMD="${VM_AUTO_CMD:-${1:-}}"
 GDB_PROMPT_TIMEOUT_SECONDS=30
 GDB_PAGER_PROMPT="--Type <RET> for more, q to quit, c to continue without paging--"
+GDB_PAGER_PROMPT_COMPACT="${GDB_PAGER_PROMPT//[[:space:]]/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DISK_PATH="$REPO_ROOT/NaCC.qcow2"
@@ -44,17 +45,21 @@ send_gdb_continue_when_ready() {
     local gdb_pane=$1
     local deadline=$((SECONDS + GDB_PROMPT_TIMEOUT_SECONDS))
     local pane_text
+    local compact_pane_text
 
     while [ "$SECONDS" -lt "$deadline" ]; do
-        pane_text=$(tmux capture-pane -pt "$gdb_pane" -S - 2>/dev/null || true)
-        if printf '%s' "$pane_text" | grep -Fq "$GDB_PAGER_PROMPT"; then
+        # Only inspect the current screen; full history keeps stale pager prompts after GDB resumes.
+        pane_text=$(tmux capture-pane -J -pt "$gdb_pane" 2>/dev/null || true)
+        compact_pane_text="${pane_text//[[:space:]]/}"
+
+        if [[ "$pane_text" == *"(gdb)"* ]]; then
+            tmux send-keys -t "$gdb_pane" "c" C-m
+            return 0
+        fi
+        if [[ "$compact_pane_text" == *"$GDB_PAGER_PROMPT_COMPACT"* ]]; then
             tmux send-keys -t "$gdb_pane" "c"
             sleep 1
             continue
-        fi
-        if printf '%s' "$pane_text" | grep -Fq "(gdb)"; then
-            tmux send-keys -t "$gdb_pane" "c" C-m
-            return 0
         fi
         sleep 1
     done
