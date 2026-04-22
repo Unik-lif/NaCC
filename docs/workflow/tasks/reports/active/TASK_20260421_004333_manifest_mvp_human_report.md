@@ -253,3 +253,116 @@ Cheap bounded sanity checks run this turn:
 Nontrivial assumption written back explicitly: for this harness follow-up, the current tmux pane screen is the right source of truth for active GDB interaction state; full pane history may retain stale pager text after resume, so pager detection must ignore scrollback and tolerate wrapped prompt whitespace.
 
 What remains deferred to reviewer / test_runner: reviewer should confirm that this visible-pane matcher still fits the repo’s host harness model, and test_runner should own the next full PR3 T1 rerun on a clean host to verify the boot crosses the pre-auto-run boundary and reaches the Linux/OpenSBI startup-coordinate logs.
+
+## 2026-04-22 01:47:28 +0800 reviewer
+
+Review verdict: approve for renewed PR3 test handoff, with `can proceed to test = yes`. I re-read the active packet [TASK_20260421_004333_manifest_mvp.md](/home/link/NaCC/docs/workflow/tasks/active/TASK_20260421_004333_manifest_mvp.md) and [CURRENT_STATE.md](/home/link/NaCC/docs/workflow/CURRENT_STATE.md), reviewed commit `1f0cd3e65978`, checked [config/tmux-debug.sh](/home/link/NaCC/config/tmux-debug.sh) directly, inspected the cited runner artifacts [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709.log](/home/link/NaCC/logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709.log), [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log](/home/link/NaCC/logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_gdb_20260422_010448.log), and [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_panes_20260422_010448.log](/home/link/NaCC/logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_005709_panes_20260422_010448.log), the coder sanity logs [TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_013318.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_013318.log), [TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_013318.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_013318.log), and [TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_pager_mock_20260422_013402.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_pager_mock_20260422_013402.log), and reran `bash -n config/tmux-debug.sh` plus a direct compact-whitespace match against the real runner-captured pager screen.
+
+Most important findings: no blocking fidelity issue remains. `send_gdb_continue_when_ready()` now stays inside the existing `make debug -> config/tmux-debug.sh -> make gdb / make launch DEBUG=1` control path, reads only the current tmux pane screen instead of stale scrollback, matches the real wrapped `--Type <RET> ...` pager prompt after whitespace compaction, and prefers a visible `(gdb)` prompt before sending the final `continue`. I found no new Linux/OpenSBI, manifest, startup-policy, or guest-lifecycle behavior in this follow-up. The remaining risk is operational rather than semantic: the next runner-owned pass still needs a clean host with no stale repo-owned QEMU holder, and the actual Linux/OpenSBI PR3 coordinate-log pair is still pending runtime evidence.
+
+Plain-English code explanation: this follow-up only changes how the debug harness tells “GDB is still in its pager” apart from “GDB is ready for `continue`.” It now recognizes the wrapped pager screen from the real failing run, clears that pager with `c`, and only sends the normal `continue` once `(gdb)` is actually visible.
+
+What the human should watch next: test_runner should rerun the same bounded PR3 T1 command on the standard `make debug` path, without manually typing `c` into GDB on the first pass and without timeout overrides unless the first fresh artifact proves they are needed. The next useful evidence is either a runner-owned boot that captures matching Linux/OpenSBI startup-coordinate logs, or the first new failing artifact if the harness still stalls earlier.
+
+## 2026-04-22 11:54:00 +0800 log_analyzer
+
+Run verdict: failed. Dominant signal is still a paused-debug host-harness boundary, but the fresh runner-owned artifacts narrow it further than the earlier “no autorun” summary: this clean-host rerun kept all three panes alive, yet QEMU never left the initial debug stop and PR3 Linux/OpenSBI coordinate reporting never executed.
+
+Observed evidence:
+- `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015.log:19-40` records `auto_running_seen=0`, `qemu_start_marker=1`, zero Linux/OpenSBI coordinate counts, and final `verdict_reason=autorun_not_observed`.
+- `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_vm_20260422_114819.log:6-11` stays in `Waiting for VM (localhost:2222) to operate...`.
+- `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_qemu_20260422_114819.log:1-9` contains only `[NaCC][qemu-run-start]`, unlike progressed boots such as `logs/TASK_20260421_004333_manifest_mvp_pr2_t1_20260421_163626_qemu_20260421_164146.log:3-120` which immediately emit OpenSBI/Linux boot text.
+- `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_gdb_20260422_114820.log:16-18,51` shows the wrapped GDB pager with many injected `c` characters and then an idle `(gdb)` prompt.
+- Repository context that matters to this boundary: `config/.gdbinit:1-8` still does not disable pagination, while `config/tmux-debug.sh:44-68` tries to drive pager and prompt state by sending keys from the harness.
+
+What this means for the next decision: the packet should go back to coder, not to test_runner, because the first bad point is still in the host debug harness. Another runner-owned rerun before narrowing this GDB auto-continue boundary would likely preserve the same “QEMU start marker only” artifact without adding PR3 runtime evidence.
+
+Likely cause and confidence:
+- Likely cause: the host harness still is not delivering a clean final inferior `continue` through the GDB pager/prompt transition, so QEMU remains paused under `-S -s`.
+- Confidence: medium-high.
+
+Evidence / Inference Boundary:
+- Fact: the preserved artifacts prove only that QEMU reached `qemu-run-start`, the VM pane stayed in SSH wait, the GDB pane ended at `(gdb)`, and no Linux/OpenSBI coordinate lines appeared.
+- Inference: the most likely explanation is a remaining bug in `send_gdb_continue_when_ready()` or the paged `make gdb` startup path. The exact failed send-key sequence is not directly logged, so that sub-mechanism is still an inference.
+
+Concrete next handoff:
+- Next owner: coder
+- Exact task: fix only the host debug harness in `config/tmux-debug.sh` and/or `config/.gdbinit` so the standard `make debug` path issues a provable inferior `continue` after GDB startup. Prefer the narrowest route, such as disabling pagination up front or adding explicit one-shot pager-clear/continue verification.
+- Keep out of scope: Linux/OpenSBI PR3 runtime-coordinate logic, manifest parsing/comparison, PR4/PR5 work, and PR2 delivery.
+
+## 2026-04-22 11:59:58 +0800 log_analyzer
+
+Run verdict: failed. The first bad point is still the host-side GDB startup/auto-continue boundary, but one repo-side inference in the earlier packet/report is now stale: the runner-owned GDB pane proves pagination was active during the failed run, while the current workspace already contains a newer uncommitted `make gdb` change that adds `-iex "set pagination off"`.
+
+Observed evidence:
+- `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015.log:19-40` still records `auto_running_seen=0`, `qemu_start_marker=1`, zero Linux/OpenSBI coordinate counts, and `verdict_reason=autorun_not_observed`.
+- `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_qemu_20260422_114819.log:1-9` still contains only `[NaCC][qemu-run-start]`, and `logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_vm_20260422_114819.log:6-11` still never leaves the SSH wait loop.
+- `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_gdb_20260422_114820.log:16-18,51` still shows an active wrapped GDB pager with repeated injected `c` characters followed by an idle `(gdb)` prompt and no visible `Continuing.` line.
+- Current repo state now shows `Makefile:349-352` launching `riscv64-unknown-linux-gnu-gdb -q -iex "set pagination off" -x $(CONFIGS)/.gdbinit`, and direct blame marks the new `-iex` line as `Not Committed Yet`; this is current workspace context, not part of the runner-owned failure artifact.
+
+What this means for the next decision:
+- Next hop should still be coder, not human or planner. The failure is still pre-boot and harness-local, but the next coder turn should start by reconciling the paged runner artifact with the existing uncommitted `Makefile` attempt instead of assuming `.gdbinit` alone is missing pagination control.
+
+Likely cause and confidence:
+- Likely cause: the failing run never delivered a real inferior `continue` after paged GDB startup, so QEMU stayed paused under `-S -s`. The uncommitted `Makefile` pagination tweak is a plausible fix candidate for the same boundary, but there is no runner-owned evidence yet that it works on the actual tmux-driven `make debug` path.
+- Confidence: medium.
+
+Evidence / Inference Boundary:
+- Fact: the runner-owned artifacts prove active GDB pagination, idle `(gdb)` state, no QEMU boot text beyond `qemu-run-start`, and no PR3 Linux/OpenSBI coordinate lines.
+- Fact: the current workspace separately proves there is now an uncommitted `Makefile` change on the `make gdb` path adding `-iex "set pagination off"`.
+- Inference: the failing run either predates that change or the change is still insufficient on the real tmux path. The logs do not prove which of those two explanations is true.
+
+Concrete next handoff:
+- Next owner: coder
+- Exact task: start with `logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_gdb_20260422_114820.log`, `Makefile:349-352`, and `config/tmux-debug.sh:44-68`; validate whether the current uncommitted `-iex "set pagination off"` change is sufficient on the real `make debug` path, and if not, land the narrowest harness-only fix that makes the inferior `continue` observable/provable.
+- Keep out of scope: Linux/OpenSBI PR3 runtime-coordinate logic, manifest parsing/comparison, PR4/PR5 work, and PR2 delivery.
+
+## 2026-04-22 12:36:51 +0800 log_analyzer
+
+Run verdict: failed. Dominant signal is still a host-side paused-debug harness boundary, and the strongest artifact to read first is [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_gdb_20260422_114820.log](/home/link/NaCC/logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_gdb_20260422_114820.log). That pane shows the wrapped GDB pager, repeated injected `c` characters, and then an idle `(gdb)` prompt, but no visible `Continuing.` line.
+
+Observed evidence:
+- [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015.log](/home/link/NaCC/logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015.log) still records `auto_running_seen=0`, `qemu_start_marker=1`, zero Linux/OpenSBI coordinate counts, and `verdict_reason=autorun_not_observed`.
+- [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_qemu_20260422_114819.log](/home/link/NaCC/logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_qemu_20260422_114819.log) still stops at `[NaCC][qemu-run-start]`, and [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_vm_20260422_114819.log](/home/link/NaCC/logs/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_vm_20260422_114819.log) never leaves the SSH wait loop.
+- Current repo state now matters to the handoff boundary: [config/.gdbinit](/home/link/NaCC/config/.gdbinit) still does not disable pagination, [Makefile](/home/link/NaCC/Makefile:349) now has an uncommitted `-iex "set pagination off"` addition on `make gdb`, and [config/tmux-debug.sh](/home/link/NaCC/config/tmux-debug.sh:44) still sends pager-clear / continue keys without any post-send verification step.
+
+What this means for the next decision: the next hop should still be coder, not human or planner. The run is not merely suspicious; it failed before PR3 Linux/OpenSBI runtime-coordinate reporting began. Another runner-owned rerun before narrowing this GDB boundary would likely reproduce the same pre-boot artifact set.
+
+Likely cause and remaining uncertainty:
+- Likely cause: the real `make debug` path still never reaches a provable inferior `continue`, so QEMU remains paused under `-S -s`.
+- Uncertain: whether the new uncommitted `Makefile` pagination-off tweak is already sufficient and just has not been rerun yet, or whether the tmux harness still needs an additional proof-oriented fix after pager handling.
+
+Evidence / Inference Boundary:
+- Fact: the runner-owned artifacts prove active GDB pagination during the failed run, no visible `Continuing.` line, no QEMU boot text beyond `qemu-run-start`, and no PR3 coordinate logs.
+- Fact: the current workspace separately proves the existence of an uncommitted `make gdb` pagination-off tweak and the absence of a post-send verification step in the harness.
+- Inference: the failure most likely sits between pager-clear and a real inferior `continue`, but the exact rejected or missing GDB command is still not directly logged.
+
+Concrete next handoff:
+- Next owner: coder
+- Exact task: reconcile the failing GDB pane with the current harness state, starting from [TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_gdb_20260422_114820.log](/home/link/NaCC/logs/test_runner/TASK_20260421_004333_manifest_mvp_pr3_t1_20260422_114015_gdb_20260422_114820.log), [Makefile](/home/link/NaCC/Makefile:349), [config/.gdbinit](/home/link/NaCC/config/.gdbinit), and [config/tmux-debug.sh](/home/link/NaCC/config/tmux-debug.sh:44). Either prove the existing pagination-off change is enough on the real tmux path, or land the narrowest harness-only fix that leaves a concrete post-continue signal before asking for another runner rerun.
+- Keep out of scope: Linux/OpenSBI PR3 runtime-coordinate logic, manifest parsing/comparison, PR4/PR5 work, and PR2 delivery.
+
+## 2026-04-22 12:49:12 +0800 coder
+
+Implemented the next narrow PR3 harness follow-up in [config/.gdbinit](/home/link/NaCC/config/.gdbinit) and [config/tmux-debug.sh](/home/link/NaCC/config/tmux-debug.sh), and updated the active packet [TASK_20260421_004333_manifest_mvp.md](/home/link/NaCC/docs/workflow/tasks/active/TASK_20260421_004333_manifest_mvp.md) for reviewer handoff. The change is committed in this turn as `[CODE]: debug confirm gdb auto-continue`.
+
+What changed and why:
+- [config/.gdbinit](/home/link/NaCC/config/.gdbinit) now sets `pagination off`, so the standard GDB startup path no longer depends on the workspace-only uncommitted `Makefile` `-iex "set pagination off"` tweak. This was needed because the packet asked me to reconcile the failing paged runner artifact with current harness state and to avoid relying on uncommitted workspace context as the only fix.
+- [config/tmux-debug.sh](/home/link/NaCC/config/tmux-debug.sh) now sends an explicit GDB-side marker `echo [NaCC][gdb-auto-continue]\n` before the single auto-continue, waits for visible `Continuing.`, and emits explicit `[NaCC][gdb-ready-timeout]` / `[NaCC][gdb-continue-unconfirmed]` diagnostics when the boundary still cannot be proven. This keeps the same `make debug -> config/tmux-debug.sh -> make gdb / make launch DEBUG=1` control model while making the “did a real inferior continue happen?” boundary observable instead of inferred from a parked `(gdb)` prompt.
+
+What I intentionally left unchanged:
+- I did not touch the accepted PR3 Linux/OpenSBI runtime-coordinate implementation (`00b914f9fde454dd580aec23bb98ccea46d13a21`, `7749352da4b272260677179b960702351f7c7e86`).
+- I did not change manifest handling, startup policy, guest lifecycle rules, or widen into PR4/PR5 work.
+- I also did not modify the already-dirty `Makefile`; the committed route for this turn is the harness config itself, not the workspace-only `Makefile` context.
+
+Cheap bounded sanity and proof:
+- `bash -n config/tmux-debug.sh` passed; log: [TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_121500.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_syntax_20260422_121500.log)
+- `git diff --check -- config/.gdbinit config/tmux-debug.sh` passed; log: [TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_121500.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_diffcheck_20260422_121500.log)
+- bounded PTY `make gdb` reached `(gdb)` without a pager prompt; log: [TASK_20260421_004333_manifest_mvp_pr3_gdb_nopager_20260422_121500.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_gdb_nopager_20260422_121500.log)
+- bounded PTY direct `./riscv-tools/bin/riscv64-unknown-linux-gnu-gdb -x config/.gdbinit` reached `(gdb)` without a pager prompt, which shows the committed `.gdbinit` alone carries the pagination-off behavior; log: [TASK_20260421_004333_manifest_mvp_pr3_gdbinit_nopager_20260422_121500.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_gdbinit_nopager_20260422_121500.log)
+- bounded tmux mock of the pane flow preserved both `[NaCC][gdb-auto-continue]` and `Continuing.` plus helper-side `[NaCC][gdb-continue-observed]`; log: [TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_continue_mock_20260422_121500.log](/home/link/NaCC/logs/coder/TASK_20260421_004333_manifest_mvp_pr3_tmux_debug_continue_mock_20260422_121500.log)
+
+Escalation and what remains deferred:
+- the tmux mock proof needed one bounded escalation because sandboxed access to the tmux socket failed with `error connecting to /tmp/tmux-1001/default (Operation not permitted)`
+- I did not rerun the full PR3 VM/QEMU/T1 loop locally; that heavy proof remains reviewer/test_runner-owned for this slice
+- reviewer should confirm the new `.gdbinit` setting and helper diagnostics stay within the intended host-only control model, and test_runner should only rerun the clean-host PR3 T1 flow after reviewer signoff

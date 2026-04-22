@@ -2,8 +2,10 @@
 
 AUTO_CMD="${VM_AUTO_CMD:-${1:-}}"
 GDB_PROMPT_TIMEOUT_SECONDS=30
+GDB_CONTINUE_OBSERVE_TIMEOUT_SECONDS=10
 GDB_PAGER_PROMPT="--Type <RET> for more, q to quit, c to continue without paging--"
 GDB_PAGER_PROMPT_COMPACT="${GDB_PAGER_PROMPT//[[:space:]]/}"
+GDB_AUTO_CONTINUE_MARKER="[NaCC][gdb-auto-continue]"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DISK_PATH="$REPO_ROOT/NaCC.qcow2"
@@ -41,6 +43,59 @@ find_live_qemu_owner() {
     return 1
 }
 
+capture_pane_screen() {
+    tmux capture-pane -J -pt "$1" 2>/dev/null || true
+}
+
+wait_for_gdb_marker_and_prompt() {
+    local gdb_pane=$1
+    local marker=$2
+    local timeout_seconds=$3
+    local deadline=$((SECONDS + timeout_seconds))
+    local pane_text
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        pane_text=$(capture_pane_screen "$gdb_pane")
+        if [[ "$pane_text" == *"$marker"* && "$pane_text" == *"(gdb)"* ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+wait_for_gdb_continue_observed() {
+    local gdb_pane=$1
+    local deadline=$((SECONDS + GDB_CONTINUE_OBSERVE_TIMEOUT_SECONDS))
+    local pane_text
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        pane_text=$(capture_pane_screen "$gdb_pane")
+        if [[ "$pane_text" == *"Continuing."* ]]; then
+            printf '[NaCC][gdb-continue-observed] pane=%s\n' "$gdb_pane"
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+attempt_gdb_continue() {
+    local gdb_pane=$1
+
+    tmux send-keys -t "$gdb_pane" "echo $GDB_AUTO_CONTINUE_MARKER\\n" C-m
+    if ! wait_for_gdb_marker_and_prompt "$gdb_pane" "$GDB_AUTO_CONTINUE_MARKER" 5; then
+        printf '[NaCC][gdb-auto-continue] pane=%s marker_not_observed_before_continue\n' "$gdb_pane"
+    fi
+
+    tmux send-keys -t "$gdb_pane" "c" C-m
+    if ! wait_for_gdb_continue_observed "$gdb_pane"; then
+        printf '[NaCC][gdb-continue-unconfirmed] pane=%s\n' "$gdb_pane"
+    fi
+}
+
 send_gdb_continue_when_ready() {
     local gdb_pane=$1
     local deadline=$((SECONDS + GDB_PROMPT_TIMEOUT_SECONDS))
@@ -49,11 +104,11 @@ send_gdb_continue_when_ready() {
 
     while [ "$SECONDS" -lt "$deadline" ]; do
         # Only inspect the current screen; full history keeps stale pager prompts after GDB resumes.
-        pane_text=$(tmux capture-pane -J -pt "$gdb_pane" 2>/dev/null || true)
+        pane_text=$(capture_pane_screen "$gdb_pane")
         compact_pane_text="${pane_text//[[:space:]]/}"
 
         if [[ "$pane_text" == *"(gdb)"* ]]; then
-            tmux send-keys -t "$gdb_pane" "c" C-m
+            attempt_gdb_continue "$gdb_pane"
             return 0
         fi
         if [[ "$compact_pane_text" == *"$GDB_PAGER_PROMPT_COMPACT"* ]]; then
@@ -64,7 +119,8 @@ send_gdb_continue_when_ready() {
         sleep 1
     done
 
-    tmux send-keys -t "$gdb_pane" "c" C-m
+    printf '[NaCC][gdb-ready-timeout] pane=%s\n' "$gdb_pane"
+    attempt_gdb_continue "$gdb_pane"
 }
 
 # Ensure we are in tmux

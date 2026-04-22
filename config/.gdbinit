@@ -1,4 +1,5 @@
 set confirm off
+set pagination off
 set architecture riscv:rv64
 target remote:1234
 add-symbol-file opensbi/build/platform/generic/firmware/fw_jump.elf 0x80000000
