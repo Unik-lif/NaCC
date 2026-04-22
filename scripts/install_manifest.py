@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 GUEST_MANIFEST_PATH = Path("/etc/nacc/manifest.json")
+GUEST_STARTUP_TABLE_PATH = Path("/etc/nacc/startup_table.bin")
 NBD_DEVICE = "/dev/nbd0"
 NBD_PARTITION = "/dev/nbd0p1"
 QEMU_SYSTEM_NAME = "qemu-system-riscv64"
@@ -34,6 +35,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "manifest",
         help="Host path to the manifest.json to copy into the guest image unchanged",
+    )
+    parser.add_argument(
+        "--startup-table",
+        help=(
+            "Optional host path to a compact startup table to install at "
+            "/etc/nacc/startup_table.bin alongside the manifest"
+        ),
     )
     return parser.parse_args()
 
@@ -169,13 +177,23 @@ def cleanup(mount_dir: Path, qemu_nbd: Path, *, mounted: bool, attached: bool) -
     return errors
 
 
-def install_manifest(manifest_path: Path) -> tuple[Path, str]:
+def install_manifest(
+    manifest_path: Path,
+    startup_table_path: Path | None = None,
+) -> list[tuple[Path, Path, str]]:
     repo_root = Path(__file__).resolve().parent.parent
     disk_path = resolve_existing_file(repo_root / "NaCC.qcow2", "disk image")
     qemu_nbd = resolve_existing_file(repo_root / "riscv-qemu" / "bin" / "qemu-nbd", "qemu-nbd")
     manifest = resolve_existing_file(manifest_path, "manifest")
+    startup_table = None
+    if startup_table_path is not None:
+        startup_table = resolve_existing_file(startup_table_path, "startup table")
     mount_dir = repo_root / "rootfs"
     guest_manifest = mount_dir / GUEST_MANIFEST_PATH.relative_to("/")
+    guest_startup_table = mount_dir / GUEST_STARTUP_TABLE_PATH.relative_to("/")
+    guest_artifacts: list[tuple[Path, Path]] = [(manifest, guest_manifest)]
+    if startup_table is not None:
+        guest_artifacts.append((startup_table, guest_startup_table))
 
     owner = find_qemu_owner(disk_path, repo_root)
     if owner is not None:
@@ -193,9 +211,9 @@ def install_manifest(manifest_path: Path) -> tuple[Path, str]:
     mount_dir.mkdir(exist_ok=True)
     mounted = False
     attached = False
-    source_hash = sha256_file(manifest)
     error: BaseException | None = None
     root_prefix = root_command_prefix()
+    installed_artifacts: list[tuple[Path, Path, str]] = []
 
     try:
         run_command(root_prefix + ["modprobe", "nbd", "max_part=16"])
@@ -204,18 +222,21 @@ def install_manifest(manifest_path: Path) -> tuple[Path, str]:
         time.sleep(2)
         run_command(root_prefix + ["mount", NBD_PARTITION, str(mount_dir)])
         mounted = True
-        run_command(root_prefix + ["mkdir", "-p", str(guest_manifest.parent)])
-        run_command(
-            root_prefix + ["install", "-m", "0644", str(manifest), str(guest_manifest)]
-        )
-
-        installed_hash = sha256_file(guest_manifest)
-        if installed_hash != source_hash:
-            raise InstallError(
-                "installed guest manifest hash does not match the source manifest"
+        for source, guest_path in guest_artifacts:
+            source_hash = sha256_file(source)
+            run_command(root_prefix + ["mkdir", "-p", str(guest_path.parent)])
+            run_command(
+                root_prefix + ["install", "-m", "0644", str(source), str(guest_path)]
             )
 
-        return manifest, installed_hash
+            installed_hash = sha256_file(guest_path)
+            if installed_hash != source_hash:
+                raise InstallError(
+                    f"installed guest file hash does not match the source for {guest_path}"
+                )
+            installed_artifacts.append((source, guest_path.relative_to(mount_dir), installed_hash))
+
+        return installed_artifacts
     except BaseException as exc:
         error = exc
     finally:
@@ -235,9 +256,16 @@ def install_manifest(manifest_path: Path) -> tuple[Path, str]:
 
 def main() -> int:
     args = parse_args()
-    manifest, digest = install_manifest(Path(args.manifest))
-    print(f"installed {manifest} -> {GUEST_MANIFEST_PATH}")
-    print(f"sha256={digest}")
+    installed_artifacts = install_manifest(
+        Path(args.manifest),
+        Path(args.startup_table) if args.startup_table else None,
+    )
+    for index, (source, guest_path, digest) in enumerate(installed_artifacts):
+        print(f"installed {source} -> /{guest_path}")
+        if index == 0:
+            print(f"sha256={digest}")
+        else:
+            print(f"sha256[{guest_path.name}]={digest}")
     return 0
 
 
