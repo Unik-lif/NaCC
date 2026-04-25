@@ -33,10 +33,18 @@ EM_NAMES = {
     243: "EM_RISCV",
 }
 PT_LOAD = 1
+PT_DYNAMIC = 2
 PT_INTERP = 3
+DT_NULL = 0
+DT_NEEDED = 1
+DT_STRTAB = 5
+DT_STRSZ = 10
 PF_X = 0x1
 PF_W = 0x2
 PF_R = 0x4
+OBJECT_ID_ENTRY = 1
+OBJECT_ID_INTERP = 2
+OBJECT_ID_DSO_BASE = 16
 
 
 class ManifestError(RuntimeError):
@@ -86,6 +94,7 @@ class ElfInfo:
     entry: int
     program_header_count: int
     interp_path: str | None
+    needed: list[str]
     loads: list[LoadSegment]
 
     def to_dict(self) -> dict[str, object]:
@@ -103,6 +112,7 @@ class ElfInfo:
             "entry": self.entry,
             "program_header_count": self.program_header_count,
             "interp_path": self.interp_path,
+            "needed": self.needed,
         }
 
 
@@ -190,6 +200,7 @@ def parse_elf(path: Path) -> ElfInfo:
         )
 
     loads: list[LoadSegment] = []
+    dynamics: list[tuple[int, int]] = []
     interp_path: str | None = None
 
     for index in range(e_phnum):
@@ -211,6 +222,9 @@ def parse_elf(path: Path) -> ElfInfo:
                 raise ManifestError(f"{path}: PT_INTERP points past the end of file")
             interp_path = read_c_string(data[p_offset:interp_end])
 
+        if p_type == PT_DYNAMIC:
+            dynamics.append((p_offset, p_filesz))
+
         if p_type == PT_LOAD:
             loads.append(
                 LoadSegment(
@@ -227,6 +241,8 @@ def parse_elf(path: Path) -> ElfInfo:
     if not loads:
         raise ManifestError(f"{path}: ELF has no PT_LOAD headers")
 
+    needed = parse_dynamic_needed(path, data, elf_class_id, endian_prefix, loads, dynamics)
+
     return ElfInfo(
         elf_class=elf_class,
         endianness=endianness,
@@ -235,8 +251,84 @@ def parse_elf(path: Path) -> ElfInfo:
         entry=e_entry,
         program_header_count=e_phnum,
         interp_path=interp_path,
+        needed=needed,
         loads=loads,
     )
+
+
+def vaddr_to_file_offset(loads: list[LoadSegment], vaddr: int) -> int | None:
+    for load in loads:
+        start = load.vaddr
+        end = load.vaddr + load.filesz
+        if start <= vaddr < end:
+            return load.offset + (vaddr - start)
+    return None
+
+
+def read_dyn_c_string(data: bytes, offset: int, limit: int) -> str:
+    if offset < 0 or offset >= len(data) or offset >= limit:
+        raise ManifestError("dynamic string offset is outside the ELF image")
+    end = data.find(b"\0", offset, limit)
+    if end < 0:
+        raise ManifestError("unterminated dynamic string")
+    return data[offset:end].decode("utf-8")
+
+
+def parse_dynamic_needed(
+    path: Path,
+    data: bytes,
+    elf_class_id: int,
+    endian_prefix: str,
+    loads: list[LoadSegment],
+    dynamics: list[tuple[int, int]],
+) -> list[str]:
+    if not dynamics:
+        return []
+    if len(dynamics) > 1:
+        raise ManifestError(f"{path}: multiple PT_DYNAMIC headers are not supported")
+
+    if elf_class_id == ELFCLASS64:
+        dyn_fmt = "QQ"
+    else:
+        dyn_fmt = "II"
+    dyn_size = struct.calcsize(endian_prefix + dyn_fmt)
+    dyn_offset, dyn_filesz = dynamics[0]
+    dyn_end = dyn_offset + dyn_filesz
+    if dyn_end > len(data):
+        raise ManifestError(f"{path}: PT_DYNAMIC points past the end of file")
+
+    needed_offsets: list[int] = []
+    strtab_vaddr: int | None = None
+    strtab_size: int | None = None
+
+    for offset in range(dyn_offset, dyn_end, dyn_size):
+        if offset + dyn_size > dyn_end:
+            raise ManifestError(f"{path}: truncated PT_DYNAMIC entry")
+        tag, val = struct.unpack_from(endian_prefix + dyn_fmt, data, offset)
+        if tag == DT_NULL:
+            break
+        if tag == DT_NEEDED:
+            needed_offsets.append(val)
+        elif tag == DT_STRTAB:
+            strtab_vaddr = val
+        elif tag == DT_STRSZ:
+            strtab_size = val
+
+    if not needed_offsets:
+        return []
+    if strtab_vaddr is None or strtab_size is None:
+        raise ManifestError(f"{path}: DT_NEEDED entries require DT_STRTAB and DT_STRSZ")
+
+    strtab_file_offset = vaddr_to_file_offset(loads, strtab_vaddr)
+    if strtab_file_offset is None:
+        raise ManifestError(f"{path}: DT_STRTAB virtual address is not file-backed")
+    if strtab_file_offset + strtab_size > len(data):
+        raise ManifestError(f"{path}: dynamic string table points past the end of file")
+
+    return [
+        read_dyn_c_string(data, strtab_file_offset + needed, strtab_file_offset + strtab_size)
+        for needed in needed_offsets
+    ]
 
 
 def resolve_existing_file(path_str: str, purpose: str) -> Path:
@@ -299,10 +391,55 @@ def resolve_interp_path(
     )
 
 
-def build_object(role: str, requested_path: str, resolved_path: Path) -> dict[str, object]:
+def resolve_needed_path(name: str, entry_path: Path, search_roots: list[Path]) -> Path:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    lib_dirs = (
+        "",
+        "lib",
+        "usr/lib",
+        "lib64",
+        "usr/lib64",
+        "lib/riscv64-linux-gnu",
+        "usr/lib/riscv64-linux-gnu",
+        "lib/x86_64-linux-gnu",
+        "usr/lib/x86_64-linux-gnu",
+    )
+
+    def add_candidate(candidate: Path) -> None:
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    if os.path.isabs(name):
+        if not search_roots:
+            raise ManifestError(
+                f"absolute DT_NEEDED path {name!r} requires at least one explicit --search-root"
+            )
+        for root in search_roots:
+            add_candidate(root / name.lstrip("/"))
+    else:
+        add_candidate(entry_path.parent / name)
+        for root in search_roots:
+            for lib_dir in lib_dirs:
+                add_candidate(root / lib_dir / name)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+
+    candidate_text = ", ".join(str(candidate) for candidate in candidates) or "<none>"
+    raise ManifestError(f"failed to resolve DT_NEEDED {name!r}; tried: {candidate_text}")
+
+
+def build_object(
+    role: str, object_id: int, requested_path: str, resolved_path: Path
+) -> dict[str, object]:
     elf_info = parse_elf(resolved_path)
     return {
         "role": role,
+        "object_id": object_id,
         "requested_path": requested_path,
         "resolved_path": str(resolved_path),
         "elf": elf_info.to_dict(),
@@ -313,12 +450,27 @@ def build_object(role: str, requested_path: str, resolved_path: Path) -> dict[st
 def render_manifest(entry_arg: str, entry_path: Path, search_roots: list[Path]) -> dict[str, object]:
     entry_elf = parse_elf(entry_path)
 
-    objects = [build_object("entry", entry_arg, entry_path)]
+    objects = [build_object("entry", OBJECT_ID_ENTRY, entry_arg, entry_path)]
+    seen_paths = {entry_path}
     interp_resolved_path: Path | None = None
 
     if entry_elf.interp_path is not None:
         interp_resolved_path = resolve_interp_path(entry_elf.interp_path, entry_path, search_roots)
-        objects.append(build_object("interp", entry_elf.interp_path, interp_resolved_path))
+        objects.append(
+            build_object("interp", OBJECT_ID_INTERP, entry_elf.interp_path, interp_resolved_path)
+        )
+        seen_paths.add(interp_resolved_path)
+
+    dso_objects = []
+    for needed_index, needed in enumerate(entry_elf.needed):
+        resolved = resolve_needed_path(needed, entry_path, search_roots)
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        dso_objects.append(
+            build_object("dso", OBJECT_ID_DSO_BASE + needed_index, needed, resolved)
+        )
+    objects.extend(dso_objects)
 
     return {
         "schema": "nacc-manifest-v1alpha1",
@@ -330,6 +482,7 @@ def render_manifest(entry_arg: str, entry_path: Path, search_roots: list[Path]) 
             "resolved_path": str(entry_path),
             "interp_path": entry_elf.interp_path,
             "interp_resolved_path": str(interp_resolved_path) if interp_resolved_path else None,
+            "initial_dso_count": len(dso_objects),
         },
         "objects": objects,
     }

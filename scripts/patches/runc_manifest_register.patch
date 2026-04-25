@@ -31,8 +31,9 @@ index 384750bf..f5f59f71 100644
 +const (
 +	naccManifestEnv               = "NACC_MANIFEST_PATH"
 +	naccManifestPageSize   uint64 = 4096
-+	naccManifestRoleEntry  uint32 = 1
-+	naccManifestRoleInterp uint32 = 2
++	naccManifestRoleEntry   uint32 = 1
++	naccManifestRoleInterp  uint32 = 2
++	naccManifestRoleDsoBase uint32 = 16
 +	naccManifestMaxLayoutRecords         = 16
 +)
 +
@@ -58,8 +59,9 @@ index 384750bf..f5f59f71 100644
 +}
 +
 +type naccManifestObject struct {
-+	Role    string               `json:"role"`
-+	PTLoads []naccManifestPTLoad `json:"pt_loads"`
++	Role     string               `json:"role"`
++	ObjectID uint32               `json:"object_id"`
++	PTLoads  []naccManifestPTLoad `json:"pt_loads"`
 +}
 +
 +type naccManifestPTLoad struct {
@@ -111,8 +113,21 @@ index 384750bf..f5f59f71 100644
 +	return identity, nil
 +}
 +
-+func naccManifestRoleID(role string) (uint32, bool) {
-+	switch role {
++func naccManifestObjectID(obj naccManifestObject) (uint32, bool) {
++	if obj.ObjectID != 0 {
++		switch obj.Role {
++		case "entry":
++			return obj.ObjectID, obj.ObjectID == naccManifestRoleEntry
++		case "interp":
++			return obj.ObjectID, obj.ObjectID == naccManifestRoleInterp
++		case "dso":
++			return obj.ObjectID, obj.ObjectID >= naccManifestRoleDsoBase
++		default:
++			return 0, false
++		}
++	}
++
++	switch obj.Role {
 +	case "entry":
 +		return naccManifestRoleEntry, true
 +	case "interp":
@@ -150,46 +165,50 @@ index 384750bf..f5f59f71 100644
 +	}
 +
 +	records := make([]naccManifestLayoutRecord, 0, len(manifest.Objects)*4)
-+	seenRoles := make(map[string]struct{}, len(manifest.Objects))
++	seenObjectIDs := make(map[uint32]struct{}, len(manifest.Objects))
++	seenEntry := false
 +	for _, obj := range manifest.Objects {
-+		roleID, ok := naccManifestRoleID(obj.Role)
++		objectID, ok := naccManifestObjectID(obj)
 +		if !ok {
-+			return nil, fmt.Errorf("unsupported manifest role %q", obj.Role)
++			return nil, fmt.Errorf("unsupported manifest object role=%q object_id=%d", obj.Role, obj.ObjectID)
 +		}
-+		if _, exists := seenRoles[obj.Role]; exists {
-+			return nil, fmt.Errorf("duplicate manifest role %q", obj.Role)
++		if _, exists := seenObjectIDs[objectID]; exists {
++			return nil, fmt.Errorf("duplicate manifest object_id %d", objectID)
 +		}
-+		seenRoles[obj.Role] = struct{}{}
++		seenObjectIDs[objectID] = struct{}{}
++		if objectID == naccManifestRoleEntry {
++			seenEntry = true
++		}
 +		if len(obj.PTLoads) == 0 {
-+			return nil, fmt.Errorf("manifest role %q has no PT_LOAD entries", obj.Role)
++			return nil, fmt.Errorf("manifest object role=%q object_id=%d has no PT_LOAD entries", obj.Role, objectID)
 +		}
 +
 +		for _, load := range obj.PTLoads {
 +			var pageEnd uint64
 +
 +			if load.Memsz == 0 {
-+				return nil, fmt.Errorf("manifest role %q PT_LOAD %d has zero memsz", obj.Role, load.ProgramHeaderIndex)
++				return nil, fmt.Errorf("manifest object role=%q object_id=%d PT_LOAD %d has zero memsz", obj.Role, objectID, load.ProgramHeaderIndex)
 +			}
 +			if len(records) >= naccManifestMaxLayoutRecords {
 +				return nil, fmt.Errorf("manifest has too many PT_LOAD entries (%d > %d)", len(records)+1, naccManifestMaxLayoutRecords)
 +			}
 +			if load.Vaddr > ^uint64(0)-load.Memsz {
-+				return nil, fmt.Errorf("manifest role %q PT_LOAD %d overflows vaddr+memsz", obj.Role, load.ProgramHeaderIndex)
++				return nil, fmt.Errorf("manifest object role=%q object_id=%d PT_LOAD %d overflows vaddr+memsz", obj.Role, objectID, load.ProgramHeaderIndex)
 +			}
 +
 +			pageEnd, err = naccAlignUp(load.Vaddr+load.Memsz, naccManifestPageSize)
 +			if err != nil {
-+				return nil, fmt.Errorf("manifest role %q PT_LOAD %d align end: %w", obj.Role, load.ProgramHeaderIndex, err)
++				return nil, fmt.Errorf("manifest object role=%q object_id=%d PT_LOAD %d align end: %w", obj.Role, objectID, load.ProgramHeaderIndex, err)
 +			}
 +
 +			pageOffset := load.Vaddr &^ (naccManifestPageSize - 1)
 +			pageSize := pageEnd - pageOffset
 +			if pageSize == 0 {
-+				return nil, fmt.Errorf("manifest role %q PT_LOAD %d produced zero page size", obj.Role, load.ProgramHeaderIndex)
++				return nil, fmt.Errorf("manifest object role=%q object_id=%d PT_LOAD %d produced zero page size", obj.Role, objectID, load.ProgramHeaderIndex)
 +			}
 +
 +			records = append(records, naccManifestLayoutRecord{
-+				Role:               roleID,
++				Role:               objectID,
 +				ProgramHeaderIndex: load.ProgramHeaderIndex,
 +				PageOffset:         pageOffset,
 +				PageSize:           pageSize,
@@ -198,7 +217,7 @@ index 384750bf..f5f59f71 100644
 +		}
 +	}
 +
-+	if _, ok := seenRoles["entry"]; !ok {
++	if !seenEntry {
 +		return nil, errors.New("manifest missing required entry object")
 +	}
 +
