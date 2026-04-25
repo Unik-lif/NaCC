@@ -43,6 +43,7 @@ OPENSBI_SRCDIR := opensbi
 
 
 OPENSBI_PLATFORM := generic
+RUN_WITHOUT_PROXY := $(abspath scripts/run_without_proxy_env.sh)
 
 # The Disk image with Ubuntu rootfs will be built from scratch
 DISK := NaCC
@@ -156,9 +157,9 @@ agent-update: agent final-image dump-agent
 .PHONY: agent
 agent: 
 	@echo "\033[0;33mBuilding Agent...\033[0m"
-	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- clean
-	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- all
-	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- objdump
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) clean
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) all
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) objdump
 	@echo "\033[0;32mAgent built successfully\033[0m"
 
 
@@ -178,7 +179,7 @@ opensbi:
 	@(cd $(OPENSBI_SRCDIR) && \
 	if command -v bear >/dev/null 2>&1; then \
 		echo "Using bear to capture OpenSBI compile_commands..."; \
-		if bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); then \
+		if $(RUN_WITHOUT_PROXY) bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); then \
 			echo "OpenSBI build with bear completed."; \
 		else \
 			echo "bear failed, falling back to plain make for OpenSBI build..."; \
@@ -343,14 +344,16 @@ agent-test:
 .PHONY: debug-qemu-gdb
 debug-qemu-gdb:
 	@echo "\033[0;33mLaunching GDB...\033[0m"
-	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-gdb -x $(CONFIGS)/a.gdbinit
+	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-gdb -q -iex "set pagination off" -x $(CONFIGS)/a.gdbinit
 
 .PHONY: gdb
 gdb:
 	@echo "\033[0;33mLaunching GDB...\033[0m"
-	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-gdb -x $(CONFIGS)/.gdbinit
+	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-gdb -q -iex "set pagination off" -x $(CONFIGS)/.gdbinit
 
 # SSH Link to the RISCV-VM
+export VM_AUTO_CMD
+
 .PHONY: vm
 vm:
 	@chmod +x config/vm_link.sh
@@ -360,10 +363,16 @@ vm:
 vm-debug:
 	sshpass -p riscv ssh -p 2222 root@localhost -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 
+ifeq ($(firstword $(MAKECMDGOALS)),debug)
+DEBUG_AUTO_CMD := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+$(foreach goal,$(DEBUG_AUTO_CMD),$(eval .PHONY: $(goal)))
+$(foreach goal,$(DEBUG_AUTO_CMD),$(eval $(goal): ; @:))
+endif
+
 .PHONY: debug
 debug:
 	@chmod +x config/tmux-debug.sh
-	@./config/tmux-debug.sh
+	@./config/tmux-debug.sh "$(DEBUG_AUTO_CMD)"
 
 
 # Logger: capture log output from named tmux panes (set by config/tmux-debug.sh)
@@ -406,15 +415,20 @@ logger:
 		cp "$$QEMU_TMP" "$$QEMU_LOG"; \
 	fi; \
 	rm -f "$$QEMU_TMP"; \
-	echo "\033[0;32mQEMU log saved to $$QEMU_LOG ($$(wc -l < "$$QEMU_LOG") lines)\033[0m"; \
-	if [ -n "$$VM_PANE" ]; then \
-		VM_LOG=$(LOG_DIR)/$(LOG)_vm_$$TIMESTAMP.log; \
-		VM_TMP=$$(mktemp); \
-		tmux capture-pane -t "$$VM_PANE" -J -p -S - > "$$VM_TMP"; \
-		VM_START=$$(grep -n '\[NaCC\]\[vm-run-start\]' "$$VM_TMP" | tail -1 | cut -d: -f1); \
-		if [ -z "$$VM_START" ]; then \
-			VM_START=$$(grep -n '\[NaCC\] Auto-running:' "$$VM_TMP" | tail -1 | cut -d: -f1); \
-		fi; \
+		echo "\033[0;32mQEMU log saved to $$QEMU_LOG ($$(wc -l < "$$QEMU_LOG") lines)\033[0m"; \
+		if [ -n "$$VM_PANE" ]; then \
+			VM_LOG=$(LOG_DIR)/$(LOG)_vm_$$TIMESTAMP.log; \
+			VM_TMP=$$(mktemp); \
+			VM_LIVE_LOG=$(LOG_DIR)/live_vm_pane_$${VM_PANE#%}.log; \
+			if [ -f "$$VM_LIVE_LOG" ]; then \
+				cp "$$VM_LIVE_LOG" "$$VM_TMP"; \
+			else \
+				tmux capture-pane -t "$$VM_PANE" -J -p -S - > "$$VM_TMP"; \
+			fi; \
+			VM_START=$$(grep -n '\[NaCC\]\[vm-run-start\]' "$$VM_TMP" | tail -1 | cut -d: -f1); \
+			if [ -z "$$VM_START" ]; then \
+				VM_START=$$(grep -n '\[NaCC\] Auto-running:' "$$VM_TMP" | tail -1 | cut -d: -f1); \
+			fi; \
 		if [ -n "$$VM_START" ]; then \
 			tail -n +"$$VM_START" "$$VM_TMP" > "$$VM_LOG"; \
 		else \

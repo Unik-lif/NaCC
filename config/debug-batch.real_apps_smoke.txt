@@ -1,0 +1,6 @@
+# Small real-application smoke suite after core semantics are stable.
+# Keep this short and reviewable before moving to larger images/workloads.
+
+docker run --security-opt seccomp=unconfined --rm python:3.11-slim python -c "import subprocess,sys; sys.stdout.write(subprocess.check_output(['sh','-c','echo hi']).decode().strip()+'\\n')"
+docker run --security-opt seccomp=unconfined --rm python:3.11-slim python -c "import json,subprocess,sys,tempfile; path=tempfile.mktemp(suffix='.json'); open(path,'w').write('{\"a\":1}'); sys.stdout.write(subprocess.check_output(['python','-c',\"import json,sys;print(json.load(open(sys.argv[1]))['a'])\",path]).decode())"
+docker run --security-opt seccomp=unconfined --rm nginx:alpine sh -c "nginx -t && echo done"

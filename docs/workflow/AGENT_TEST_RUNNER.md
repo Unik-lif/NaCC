@@ -12,6 +12,29 @@ Run one controlled test loop:
 
 This role is not planner and does not change plans.
 This role is not log analyzer and does not explain failures.
+This role should be easy to restart fresh from a packet or one explicit command.
+
+## Launch Policy
+
+The harness launches `test_runner` with a more permissive Codex execution policy than most other roles.
+
+Default harness behavior:
+
+- `--sandbox danger-full-access`
+- `--ask-for-approval never`
+
+Reason:
+
+- packet-owned validation often needs builds, tmux, and operational commands that are annoying to approve one by one
+- for NaCC's current workflow, repeated approval stops in `test_runner` are treated as higher cost than the residual risk of non-interactive execution
+
+Operator overrides:
+
+- `NACC_TEST_RUNNER_SANDBOX=workspace-write|danger-full-access`
+- `NACC_TEST_RUNNER_APPROVAL=untrusted|on-failure|on-request|never`
+- `NACC_TEST_RUNNER_BYPASS=1`
+  - this uses `--dangerously-bypass-approvals-and-sandbox`
+  - use only when you intentionally want the highest-friction removal and accept the extra risk
 
 ## Read First
 
@@ -24,6 +47,7 @@ This role is not log analyzer and does not explain failures.
 Minimum required input:
 
 - the test command for this round
+- or a task packet that already declares the test command / validation tier
 
 Expected input format:
 
@@ -31,6 +55,7 @@ Expected input format:
   - `docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo alpha | wc -c; echo done"`
 - pass that full command into `VM_AUTO_CMD`
 - do not permanently rewrite `config/vm_link.sh` for a one-off test
+- if the run succeeds but the packet still requests post-run analysis or the log is too long for a human to read directly, set `Status: needs_analysis` and route to `log_analyzer` instead of pretending "success" means no more work
 
 Optional input:
 
@@ -54,6 +79,7 @@ When the user provides multiple commands or explicitly asks for repeated/backgro
   - clean up successful windows and keep failed ones
 - default reporting policy:
   - report the `launcher.log` path first
+  - after launching a detached batch, return immediately with the batch session name and `launcher.log` path unless the user explicitly asks the runner to wait
   - do not follow `launcher.log` continuously by default
 - only if explicitly asked, use:
   - `tail -f logs/<batch-session>.launcher.log`
@@ -140,10 +166,14 @@ Report only:
 - in batch mode, also report:
   - batch session name
   - launcher log path
+  - for detached batch runs, a launch-and-handoff response is the default; do not wait for completion unless the user explicitly asks for waiting or live follow
   - if the batch is still running, say that progress can be followed from the launcher log later
 - whether manual intervention is needed
+- whether post-run log analysis is still needed
 
 Do not include root-cause analysis.
+If the run fails, hand off the log path and minimal context to log analyzer instead of mixing diagnosis into the runner report.
+If the run succeeds but log interpretation is still needed, set `Status: needs_analysis`, record the primary log path, and set up that handoff explicitly instead of leaving the human with raw long logs.
 
 ## Guardrails
 

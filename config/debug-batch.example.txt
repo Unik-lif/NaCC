@@ -1,0 +1,3 @@
+# One command per line. Empty lines and comments are ignored.
+docker run --security-opt seccomp=unconfined --rm python:3.11-slim python -c "exec(\"from multiprocessing.shared_memory import SharedMemory\\nimport os,sys\\nshm=SharedMemory(create=True,size=4096)\\npid=os.fork()\\nif pid==0:\\n    child=SharedMemory(name=shm.name)\\n    child.buf[:4]=b'ping'\\n    child.close()\\n    os._exit(0)\\nos.waitpid(pid,0)\\nsys.stdout.write(bytes(shm.buf[:4]).decode()+'\\\\n')\\nshm.close()\\nshm.unlink()\")"
+# docker run --security-opt seccomp=unconfined --rm -v /root/nacc_shm_repro:/nacc_shm_repro:ro busybox /nacc_shm_repro

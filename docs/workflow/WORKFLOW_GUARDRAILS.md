@@ -35,6 +35,7 @@ Requirements:
 Trigger when:
 
 - coder is being used as planner
+- reviewer is being used as planner or log analyzer
 - planner is being used for raw log forensics
 - paper scout is being used to commit to an implementation from papers
 
@@ -104,6 +105,13 @@ Suggested action:
 - Focus on evidence and root-cause paths.
 - Do not make broad architecture commitments directly from one log.
 - If architecture-level action is needed, say what the evidence supports and what it does not support, then route to planner.
+
+### Reviewer
+
+- Review bounded artifacts, not open-ended ideas.
+- Findings should be about risk, scope, and validation gaps first.
+- If the core issue is architectural, route to planner.
+- If the core issue is failing evidence, route to test runner or log analyzer instead of guessing.
 
 ### Paper Scout
 

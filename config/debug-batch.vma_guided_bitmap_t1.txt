@@ -1,0 +1,17 @@
+# TASK_20260415_154406_vma_guided_bitmap T1 validation batch
+
+# Targeted PRIVATE_DATA / syscall-buffer grounding.
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'printf alpha >/dev/null; echo kernel_read_done'
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'IFS= read -r line </etc/hostname; echo kernel_write_done'
+
+# Anonymous-private / COW-oriented repro.
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'a=seed; (a=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; :); echo fork_private_done'
+
+# Split file-backed / pipeline probes from the packet.
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'cat /etc/hostname; echo done'
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'echo alpha | cat; echo done'
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'wc -c /etc/hostname; echo done'
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'echo alpha | wc -c; echo done'
+
+# Existing shared-memory regression repro kept in the batch.
+docker run --security-opt seccomp=unconfined --rm -v /root/nacc_shm_repro:/nacc_shm_repro:ro busybox /nacc_shm_repro

@@ -1,0 +1,10 @@
+# Post-fork+exec core regression and process-semantics suite.
+# One command per line. Empty lines and comments are ignored.
+
+docker run --security-opt seccomp=unconfined --rm busybox sh -c "cat /etc/hostname; echo done"
+docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo alpha | wc -c; echo done"
+docker run --security-opt seccomp=unconfined --rm busybox sh -c "for i in 1 2 3 4 5; do /bin/true; done; echo done"
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'for i in 1 2 3 4 5 6 7 8; do echo child-$i & done; wait; echo done'
+docker run --security-opt seccomp=unconfined --rm busybox sh -c "sh -c 'echo inner-1'; sh -c 'echo inner-2'; echo done"
+docker run --security-opt seccomp=unconfined --rm busybox sh -c "echo one | cat | wc -l; echo done"
+docker run --security-opt seccomp=unconfined --rm busybox sh -c 'for i in 1 2 3; do cat /etc/hostname >/dev/null & done; wait; echo done'

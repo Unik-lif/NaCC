@@ -1,0 +1,267 @@
+diff --git a/libcontainer/standard_init_linux.go b/libcontainer/standard_init_linux.go
+index 384750bf..f5f59f71 100644
+--- a/libcontainer/standard_init_linux.go
++++ b/libcontainer/standard_init_linux.go
+@@ -1,10 +1,15 @@
+ package libcontainer
+ 
+ import (
+ 	"errors"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
++	"crypto/sha256"
++	"encoding/json"
++	"strconv"
++	"strings"
++	"unsafe"
+ 
+ 	"github.com/opencontainers/runtime-spec/specs-go"
+ 	"github.com/opencontainers/selinux/go-selinux"
+@@ -19,6 +24,189 @@ import (
+ 	"github.com/opencontainers/runc/libcontainer/utils"
+ )
+ 
++const (
++	// SYS_TRANSFER_PTP = 255
++	SYS_NACC_REGISTER = 256
++	// SYS_NACC_INVOKE = 257
++)
++
++const (
++	naccManifestEnv               = "NACC_MANIFEST_PATH"
++	naccManifestPageSize   uint64 = 4096
++	naccManifestRoleEntry  uint32 = 1
++	naccManifestRoleInterp uint32 = 2
++	naccManifestMaxLayoutRecords         = 16
++)
++
++type naccManifestIdentity struct {
++	path     string
++	pathData []byte
++	size     uint64
++	sha256   [sha256.Size]byte
++}
++
++type naccManifestLayoutRecord struct {
++	Role               uint32
++	ProgramHeaderIndex uint32
++	PageOffset         uint64
++	PageSize           uint64
++	FlagsRaw           uint32
++	Reserved           uint32
++}
++
++type naccManifestJSON struct {
++	Schema  string               `json:"schema"`
++	Objects []naccManifestObject `json:"objects"`
++}
++
++type naccManifestObject struct {
++	Role    string               `json:"role"`
++	PTLoads []naccManifestPTLoad `json:"pt_loads"`
++}
++
++type naccManifestPTLoad struct {
++	ProgramHeaderIndex uint32            `json:"program_header_index"`
++	Vaddr              uint64            `json:"vaddr"`
++	Memsz              uint64            `json:"memsz"`
++	Flags              naccManifestFlags `json:"flags"`
++}
++
++type naccManifestFlags struct {
++	Raw uint32 `json:"raw"`
++}
++
++func naccLookupEnv(env []string, key string) (string, bool) {
++	prefix := key + "="
++	for _, entry := range env {
++		if strings.HasPrefix(entry, prefix) {
++			return entry[len(prefix):], true
++		}
++	}
++	return "", false
++}
++
++func naccLoadManifestIdentity(env []string) (*naccManifestIdentity, error) {
++	path, ok := naccLookupEnv(env, naccManifestEnv)
++	if !ok || path == "" {
++		return nil, nil
++	}
++
++	info, err := os.Stat(path)
++	if err != nil {
++		return nil, fmt.Errorf("stat manifest %q: %w", path, err)
++	}
++	if !info.Mode().IsRegular() {
++		return nil, fmt.Errorf("manifest path %q is not a regular file", path)
++	}
++
++	blob, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("read manifest %q: %w", path, err)
++	}
++
++	identity := &naccManifestIdentity{
++		path:     path,
++		pathData: append([]byte(path), 0),
++		size:     uint64(len(blob)),
++		sha256:   sha256.Sum256(blob),
++	}
++	return identity, nil
++}
++
++func naccManifestRoleID(role string) (uint32, bool) {
++	switch role {
++	case "entry":
++		return naccManifestRoleEntry, true
++	case "interp":
++		return naccManifestRoleInterp, true
++	default:
++		return 0, false
++	}
++}
++
++func naccAlignUp(value, alignment uint64) (uint64, error) {
++	if alignment == 0 || alignment&(alignment-1) != 0 {
++		return 0, fmt.Errorf("invalid alignment %d", alignment)
++	}
++	if value > ^uint64(0)-(alignment-1) {
++		return 0, errors.New("alignment overflow")
++	}
++	return (value + alignment - 1) &^ (alignment - 1), nil
++}
++
++func naccLoadManifestLayout(path string) ([]naccManifestLayoutRecord, error) {
++	blob, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("read manifest %q: %w", path, err)
++	}
++
++	var manifest naccManifestJSON
++	if err := json.Unmarshal(blob, &manifest); err != nil {
++		return nil, fmt.Errorf("parse manifest %q: %w", path, err)
++	}
++	if manifest.Schema != "nacc-manifest-v1alpha1" {
++		return nil, fmt.Errorf("unsupported manifest schema %q", manifest.Schema)
++	}
++	if len(manifest.Objects) == 0 {
++		return nil, errors.New("manifest objects must not be empty")
++	}
++
++	records := make([]naccManifestLayoutRecord, 0, len(manifest.Objects)*4)
++	seenRoles := make(map[string]struct{}, len(manifest.Objects))
++	for _, obj := range manifest.Objects {
++		roleID, ok := naccManifestRoleID(obj.Role)
++		if !ok {
++			return nil, fmt.Errorf("unsupported manifest role %q", obj.Role)
++		}
++		if _, exists := seenRoles[obj.Role]; exists {
++			return nil, fmt.Errorf("duplicate manifest role %q", obj.Role)
++		}
++		seenRoles[obj.Role] = struct{}{}
++		if len(obj.PTLoads) == 0 {
++			return nil, fmt.Errorf("manifest role %q has no PT_LOAD entries", obj.Role)
++		}
++
++		for _, load := range obj.PTLoads {
++			var pageEnd uint64
++
++			if load.Memsz == 0 {
++				return nil, fmt.Errorf("manifest role %q PT_LOAD %d has zero memsz", obj.Role, load.ProgramHeaderIndex)
++			}
++			if len(records) >= naccManifestMaxLayoutRecords {
++				return nil, fmt.Errorf("manifest has too many PT_LOAD entries (%d > %d)", len(records)+1, naccManifestMaxLayoutRecords)
++			}
++			if load.Vaddr > ^uint64(0)-load.Memsz {
++				return nil, fmt.Errorf("manifest role %q PT_LOAD %d overflows vaddr+memsz", obj.Role, load.ProgramHeaderIndex)
++			}
++
++			pageEnd, err = naccAlignUp(load.Vaddr+load.Memsz, naccManifestPageSize)
++			if err != nil {
++				return nil, fmt.Errorf("manifest role %q PT_LOAD %d align end: %w", obj.Role, load.ProgramHeaderIndex, err)
++			}
++
++			pageOffset := load.Vaddr &^ (naccManifestPageSize - 1)
++			pageSize := pageEnd - pageOffset
++			if pageSize == 0 {
++				return nil, fmt.Errorf("manifest role %q PT_LOAD %d produced zero page size", obj.Role, load.ProgramHeaderIndex)
++			}
++
++			records = append(records, naccManifestLayoutRecord{
++				Role:               roleID,
++				ProgramHeaderIndex: load.ProgramHeaderIndex,
++				PageOffset:         pageOffset,
++				PageSize:           pageSize,
++				FlagsRaw:           load.Flags.Raw,
++			})
++		}
++	}
++
++	if _, ok := seenRoles["entry"]; !ok {
++		return nil, errors.New("manifest missing required entry object")
++	}
++
++	return records, nil
++}
++
+ type linuxStandardInit struct {
+ 	pipe          *syncSocket
+ 	consoleSocket *os.File
+@@ -283,6 +351,21 @@ func (l *linuxStandardInit) Init() error {
+ 		}
+ 	}
+ 
++	manifestIdentity, err := naccLoadManifestIdentity(l.config.Env)
++	if err != nil {
++		logrus.Warnf("nacc manifest identity unavailable for container %s: %v", l.config.ContainerID, err)
++		manifestIdentity = nil
++	}
++
++	var manifestLayout []naccManifestLayoutRecord
++	if manifestIdentity != nil {
++		manifestLayout, err = naccLoadManifestLayout(manifestIdentity.path)
++		if err != nil {
++			logrus.Warnf("nacc manifest layout unavailable for container %s: %v", l.config.ContainerID, err)
++			manifestLayout = nil
++		}
++	}
++
+ 	// Close all file descriptors we are not passing to the container. This is
+ 	// necessary because the execve target could use internal runc fds as the
+ 	// execve path, potentially giving access to binary files from the host
+@@ -296,5 +378,34 @@ func (l *linuxStandardInit) Init() error {
+ 	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
+ 		return err
+ 	}
++
++	// _, _, _ = unix.Syscall6(SYS_TRANSFER_PTP, 0, 0, 0, 0, 0, 0)
++	containerID := l.config.ContainerID
++	shortID := containerID
++
++	if len(shortID) >= 12 {
++		shortID = shortID[:12]
++	}
++
++	idVal, _ := strconv.ParseUint(shortID, 16, 64)
++
++	var manifestPathPtr uintptr
++	var manifestSHA256Ptr uintptr
++	var manifestSize uintptr
++	var manifestLayoutPtr uintptr
++	var manifestLayoutCount uintptr
++	if manifestIdentity != nil {
++		manifestPathPtr = uintptr(unsafe.Pointer(&manifestIdentity.pathData[0]))
++		manifestSHA256Ptr = uintptr(unsafe.Pointer(&manifestIdentity.sha256[0]))
++		manifestSize = uintptr(manifestIdentity.size)
++	}
++	if len(manifestLayout) > 0 {
++		manifestLayoutPtr = uintptr(unsafe.Pointer(&manifestLayout[0]))
++		manifestLayoutCount = uintptr(len(manifestLayout))
++	}
++	if _, _, errno := unix.Syscall6(SYS_NACC_REGISTER, uintptr(idVal), manifestPathPtr, manifestSHA256Ptr, manifestSize, manifestLayoutPtr, manifestLayoutCount); errno != 0 {
++		logrus.Warnf("nacc register syscall failed for container %s: %v", l.config.ContainerID, errno)
++	}
++
+ 	return system.Exec(name, l.config.Args, l.config.Env)
+ }

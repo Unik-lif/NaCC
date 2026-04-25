@@ -214,6 +214,16 @@ Goal:
 - identify which fields must become per-thread owned state
 - identify which fields are only per-hart loaded cache
 
+The current stage-1 role split and variable formalization are captured in:
+
+- `docs/workflow/PLAN_20260328_stage1_runtime_roles.md`
+
+The first coding round intentionally uses a reduced v0 model:
+
+- per-`pid` `thread_ctx`
+- no `mm_handle`
+- no generation / epoch field yet
+
 ### Stage 2: Introduce `nacc_thread_ctx`
 
 Create a minimum trusted object on the OpenSBI side:

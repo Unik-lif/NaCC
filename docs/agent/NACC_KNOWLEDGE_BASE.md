@@ -305,6 +305,149 @@ Current design tendency:
 - it should not collapse into "run full agent init again"
 - a lighter refresh path is preferable
 
+### 6.4 Agent trap-return stack-offset contract is fragile and not a real ABI
+
+2026-03-31 这一轮调试确认了一个需要长期记住的事实：
+
+- `__offset32` 和 `__offset48` 这两条 agent 返回路径，本质上是在假设：
+  - Linux 对应 trap handler 的入口/出口序列
+  - 在 agent 重新接管控制流时留下的 `sp`
+  - 以及 Linux `pt_regs` 相对当前 `sp` 的偏移
+  是稳定的
+- 这种假设不是一个真正可靠的 ABI，只是历史上“刚好对得上”的硬编码约定
+
+当前已确认的含义：
+
+1. `__offset32` 对应 IRQ 类路径
+2. `__offset48` 对应 user syscall / page fault 类路径
+3. 这两个路径里的 `sp += 常量` 方案，依赖 Linux trap handler 前序压栈行为保持不变
+
+已经观察到的实际后果：
+
+- 只要 Linux 侧改动让 trap handler 的前序压栈/栈布局发生变化，即使只是：
+  - 加 `printk`
+  - 改代码后重新编译导致 codegen 变化
+  - 改局部变量/寄存器分配
+- agent 侧仍使用旧的 `offset32/offset48`，就可能出现：
+  - 控制流大体回到对的位置
+  - 但恢复寄存器时 frame base 已经错位
+  - 典型症状是 `a7` 变成用户地址样的值，而不是 syscall number
+  - `ra/status/tp/cause` 等字段也开始呈现明显错位特征
+
+这一轮日志给出的具体模式是：
+
+- Linux `do_trap_ecall_u` 仍看到一个正常的 `regs`
+- 但 agent 在 `trampoline=0x240 -> __offset48 -> __offset32 -> __ret_from_exception` 的返回链上，
+  已经用错了 frame base
+- 随后下一次 syscall 再进 Linux 时，`a7` 已经脏掉
+
+长期约束：
+
+- **不要把 Linux trap handler 的压栈偏移当成稳定 ABI。**
+- 任何 Linux trap path 相关改动后，都必须重新验证：
+  - `__offset32`
+  - `__offset48`
+  - `__ret_from_exception`
+- 更好的长期方向不是“手动同步新的偏移值”，而是逐步消除这种隐式偏移契约，改成显式、可验证的 `pt_regs` / restore-base 协议。
+
+### 6.5 OpenSBI must not directly dereference Linux virtual addresses
+
+2026-03-31 另一条已经确认的稳定约束：
+
+- OpenSBI 里拿到的 Linux 指针，默认只能当作“opaque handoff argument”看待
+- 除非它指向的是 OpenSBI 自己显式建立并确认可访问的物理映射，否则不能直接解引用
+
+在当前 NaCC 语境里，尤其要记住：
+
+- `user_pt_regs` 是 Linux 虚拟地址，不是 OpenSBI 可直接安全解引用的物理地址
+- OpenSBI 可以：
+  - 传递它
+  - 打印这个指针值本身
+  - 把它交给 agent 作为 handoff input
+- OpenSBI 不可以直接做：
+  - `regs = (struct ... *)user_pt_regs`
+  - `regs->epc / regs->sp / regs->a0 ...`
+
+已经踩过的具体错误模式：
+
+- 在 `sm_nacc_attach_forked_child()` 的 child return-contract 日志里，
+  OpenSBI 直接解引用了 `user_pt_regs`
+- 日志表面上看像是“卡在打印附近”
+- 但真实错误点是打印后对 Linux VA 的第一次 `ld`
+
+长期约束：
+
+- **OpenSBI 这边能直接解引用的，必须是它自己确认过的物理地址或 monitor-owned 映射，不是普通 Linux 虚拟地址。**
+- 如果需要观测 Linux `pt_regs` 内容：
+  - 优先在 Linux 侧打印
+  - 或者由 agent 在自己的可用上下文里打印
+  - 不要在 OpenSBI 里直接展开 Linux VA。
+
+### 6.6 `sscratch` / `tp` / `kernel_sp` is a return-to-user protocol, not a generic per-pid save slot
+
+2026-04-01 另一条已经被这轮修复强化出来的长期结论：
+
+- 在 RISC-V Linux 里，`sscratch` 的核心作用不是“长期保存某个进程的上下文”
+- 它更像是：
+  - **下次从用户 trap 进内核时，用来快速找回当前 task 的 kernel `tp/current` 的 hart-local 引导寄存器**
+- 真正长期有效的内核态身份锚点是 **live 的 kernel `tp`**
+
+Linux 原生多进程是这样工作的：
+
+1. 调度切换时，`__switch_to()` 直接把 live `tp` 切成 `next`
+2. trap 入口时：
+   - `csrrw tp, sscratch, tp`
+   - 用 `sscratch` 取回当前 task 的 kernel `tp`
+   - 再把用户 `tp` 存进 `pt_regs->tp`
+   - 然后很快把 `sscratch` 清成 `0`
+3. 真正返回用户前，`ret_from_exception()` 再做：
+   - `KERNEL_SP(tp) = sp + PT_SIZE`
+   - `sscratch = tp`
+
+也就是说，Linux 支持多进程的关键不是：
+
+- “为每个进程长期保存一份 `sscratch`”
+
+而是：
+
+- **调度时切 live `tp`**
+- **返回用户前重新用当前 live `tp` 重建 `sscratch`**
+
+对 NaCC 的直接启示：
+
+- 不要把 `sscratch` 先验地当成必须塞进 `thread_ctx(pid)` 的第一类状态
+- 在当前 v0 设计下，OpenSBI 的 `thread_ctx` 更适合保存：
+  - `trampoline`
+  - `saved_nacc_sstatus`
+  - 这类跨 Linux-owned window 必须持久化的 continuation state
+- `sscratch` 更像是一种 **return-to-user 时应当用当前正确 kernel `tp` 重新建立的 hart-local anchor**
+
+这也解释了为什么 2026-03-31 那轮真正修好的不是“保存旧 `sscratch`”，而是：
+
+- 在 `invoke_full / reexec / fork-child attach` 这些
+  `monitor -> agent -> user`
+  的 direct path 里
+- agent 原来没有可靠拿到“当前进程对应的 kernel `tp`”
+- 修复方式应是：
+  - **显式把当前 kernel `tp` 传给 agent**
+  - 然后在 `__agent_exit` 里像 Linux `ret_from_exception()` 一样重建：
+    - `KERNEL_SP(tp)`
+    - `sscratch = tp`
+
+长期审计约束：
+
+- 判断一个路径是否正确，不要只问“有没有保存 `sscratch`”
+- 更应该问：
+  - 当前 live `tp` 是否已经是正确的 current/task anchor
+  - 返回用户前是否重新做了：
+    - `KERNEL_SP(tp) = ...`
+    - `sscratch = tp`
+- 只有在未来要支持更复杂的：
+  - AGENT 中途可调度
+  - 跨 hart 恢复
+  - 或更强的 monitor-owned runtime anchor
+  时，才应重新评估 `sscratch` 是否需要进入 per-pid runtime context
+
 ## 7. Runtime-Context Direction
 
 New accepted invariants:
