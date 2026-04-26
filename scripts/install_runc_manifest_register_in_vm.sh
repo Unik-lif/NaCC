@@ -206,8 +206,10 @@ if git apply --check --reverse "${guest_patch_path}" >/dev/null 2>&1; then
     echo '[nacc-runc-vm] installer_path=already_applied_reverse_check'
     echo '[nacc-runc-vm] patch already applied'
 elif guest_runc_manifest_patch_present "${guest_runc_file}"; then
-    echo '[nacc-runc-vm] installer_path=semantic_match'
-    echo '[nacc-runc-vm] patch already applied (semantic match)'
+    echo '[nacc-runc-vm] installer_path=semantic_match_reconstruct'
+    echo '[nacc-runc-vm] semantic match is not exact; reconstructing from HEAD plus current patch'
+    upgrade_guest_runc_manifest_patch_from_head "${guest_runc_dir}" "${guest_patch_path}" "${guest_runc_file}"
+    echo '[nacc-runc-vm] refreshed layout-aware patch via HEAD reconstruction'
 elif guest_runc_manifest_identity_only_patch_present "${guest_runc_file}"; then
     echo '[nacc-runc-vm] installer_path=legacy_head_reconstruction'
     upgrade_guest_runc_manifest_patch_from_head "${guest_runc_dir}" "${guest_patch_path}" "${guest_runc_file}"
@@ -230,6 +232,7 @@ if command -v gofmt >/dev/null 2>&1; then
 else
     echo '[nacc-runc-vm] gofmt not found; skipping formatting'
 fi
+log_guest_runc_manifest_shape "final" "${guest_runc_file}"
 
 echo '[nacc-runc-vm] building runc'
 make

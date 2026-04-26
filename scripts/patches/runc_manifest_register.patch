@@ -190,7 +190,10 @@ index 384750bf..f5f59f71 100644
 +				return nil, fmt.Errorf("manifest object role=%q object_id=%d PT_LOAD %d has zero memsz", obj.Role, objectID, load.ProgramHeaderIndex)
 +			}
 +			if len(records) >= naccManifestMaxLayoutRecords {
-+				return nil, fmt.Errorf("manifest has too many PT_LOAD entries (%d > %d)", len(records)+1, naccManifestMaxLayoutRecords)
++				if objectID >= naccManifestRoleDsoBase {
++					continue
++				}
++				return nil, fmt.Errorf("manifest has too many required PT_LOAD entries (%d > %d)", len(records)+1, naccManifestMaxLayoutRecords)
 +			}
 +			if load.Vaddr > ^uint64(0)-load.Memsz {
 +				return nil, fmt.Errorf("manifest object role=%q object_id=%d PT_LOAD %d overflows vaddr+memsz", obj.Role, objectID, load.ProgramHeaderIndex)
