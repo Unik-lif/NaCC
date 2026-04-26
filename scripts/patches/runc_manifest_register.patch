@@ -18,7 +18,7 @@ index 384750bf..f5f59f71 100644
  
  	"github.com/opencontainers/runtime-spec/specs-go"
  	"github.com/opencontainers/selinux/go-selinux"
-@@ -19,6 +24,189 @@ import (
+@@ -19,6 +24,211 @@ import (
  	"github.com/opencontainers/runc/libcontainer/utils"
  )
  
@@ -230,7 +230,7 @@ index 384750bf..f5f59f71 100644
  type linuxStandardInit struct {
  	pipe          *syncSocket
  	consoleSocket *os.File
-@@ -283,6 +351,21 @@ func (l *linuxStandardInit) Init() error {
+@@ -283,6 +493,21 @@ func (l *linuxStandardInit) Init() error {
  		}
  	}
  
@@ -252,7 +252,7 @@ index 384750bf..f5f59f71 100644
  	// Close all file descriptors we are not passing to the container. This is
  	// necessary because the execve target could use internal runc fds as the
  	// execve path, potentially giving access to binary files from the host
-@@ -296,5 +378,34 @@ func (l *linuxStandardInit) Init() error {
+@@ -296,5 +521,34 @@ func (l *linuxStandardInit) Init() error {
  	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
  		return err
  	}
