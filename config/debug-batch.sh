@@ -121,6 +121,84 @@ wait_for_auto_running() {
 	return 1
 }
 
+wait_for_auto_completion() {
+	local live_log="$1"
+	local completion_timeout="$2"
+	local elapsed=0
+	local exit_code
+
+	while [ "$elapsed" -lt "$completion_timeout" ]; do
+		if [ -f "$live_log" ]; then
+			if grep -Fq '[NaCC][ssh-auto-timeout]' "$live_log"; then
+				echo "auto-timeout"
+				return 0
+			fi
+			exit_code="$(sed -n 's/.*\[NaCC\]\[ssh-auto-exit\] code=\([0-9][0-9]*\).*/\1/p' "$live_log" | awk '$1 != 255 { code=$1 } END { if (code != "") print code; else exit 1 }' || true)"
+			if [ -n "$exit_code" ]; then
+				echo "auto-exit-$exit_code"
+				return 0
+			fi
+		fi
+		sleep 2
+		elapsed=$((elapsed + 2))
+	done
+
+	return 1
+}
+
+capture_logger_output() {
+	local pane="$1"
+
+	tmux capture-pane -J -p -t "$pane" -S -80 2>/dev/null || true
+}
+
+extract_logger_path() {
+	local output="$1"
+	local kind="$2"
+
+	case "$kind" in
+		qemu)
+			printf "%s\n" "$output" | sed -n 's/.*QEMU log saved to \([^ ]*\) (.*/\1/p' | tail -n 1
+			;;
+		vm)
+			printf "%s\n" "$output" | sed -n 's/.*VM   log saved to \([^ ]*\) (.*/\1/p' | tail -n 1
+			;;
+	esac
+}
+
+latest_tagged_log() {
+	local tag="$1"
+	local kind="$2"
+
+	find logs -maxdepth 1 -type f -name "${tag}_${kind}_*.log" -printf '%T@ %p\n' 2>/dev/null \
+		| sort -n \
+		| tail -n 1 \
+		| sed 's/^[^ ]* //'
+}
+
+resolve_logger_paths() {
+	local output="$1"
+	local tag="$2"
+	local qemu_log vm_log
+
+	qemu_log="$(extract_logger_path "$output" qemu)"
+	vm_log="$(extract_logger_path "$output" vm)"
+
+	if [ -z "$qemu_log" ]; then
+		qemu_log="$(latest_tagged_log "$tag" qemu)"
+	fi
+	if [ -z "$vm_log" ]; then
+		vm_log="$(latest_tagged_log "$tag" vm)"
+	fi
+
+	if [ -n "$qemu_log" ] && [ -n "$vm_log" ]; then
+		printf '%s\n%s\n' "$qemu_log" "$vm_log"
+		return 0
+	fi
+
+	return 1
+}
+
 print_result_summary() {
 	local line
 	echo
@@ -153,6 +231,9 @@ run_one() {
 	local command="$2"
 	local ts tag escaped_cmd window_id startup_pane logger_pane live_log
 	local logger_output qemu_log vm_log
+	local logger_paths_text
+	local completion_status auto_status
+	local -a logger_paths
 
 	ts="$(date +%Y%m%d_%H%M%S)"
 	tag="${TAG_PREFIX}_$(printf '%02d' "$index")_${ts}"
@@ -189,16 +270,46 @@ run_one() {
 		return 1
 	fi
 
-	echo "[batch] auto-running detected, waiting ${WAIT_AFTER_AUTO_SEC}s for command output"
-	sleep "$WAIT_AFTER_AUTO_SEC"
+	completion_status="ok"
+	echo "[batch] auto-running detected, waiting up to ${WAIT_AFTER_AUTO_SEC}s for ssh auto completion"
+	if auto_status="$(wait_for_auto_completion "$live_log" "$WAIT_AFTER_AUTO_SEC")"; then
+		case "$auto_status" in
+			auto-exit-0)
+				completion_status="ok"
+				;;
+			auto-exit-*)
+				echo "[batch] failed: ssh auto command exited ${auto_status#auto-exit-}" >&2
+				completion_status="$auto_status"
+				BATCH_FAILED=1
+				;;
+			auto-timeout)
+				echo "[batch] failed: ssh auto command timed out" >&2
+				completion_status="$auto_status"
+				BATCH_FAILED=1
+				;;
+			*)
+				echo "[batch] failed: unknown ssh auto completion status: $auto_status" >&2
+				completion_status="auto-completion-unknown"
+				BATCH_FAILED=1
+				;;
+		esac
+	else
+		echo "[batch] failed: ssh auto completion marker timeout" >&2
+		completion_status="auto-completion-timeout"
+		BATCH_FAILED=1
+	fi
 
 	logger_pane="$(tmux split-window -P -F '#{pane_id}' -t "$window_id" -c "$ROOT_DIR" 'bash')"
 	tmux send-keys -t "$logger_pane" "make logger LOG=$tag" C-m
 
 	logger_output=""
 	for _ in $(seq 1 120); do
-		logger_output="$(tmux capture-pane -p -t "$logger_pane" -S -40 2>/dev/null || true)"
-		if printf "%s" "$logger_output" | grep -Fq 'log saved to'; then
+		logger_output="$(capture_logger_output "$logger_pane")"
+		logger_paths_text="$(resolve_logger_paths "$logger_output" "$tag" || true)"
+		if [ -n "$logger_paths_text" ]; then
+			readarray -t logger_paths <<< "$logger_paths_text"
+			qemu_log="${logger_paths[0]}"
+			vm_log="${logger_paths[1]}"
 			break
 		fi
 		sleep 1
@@ -206,13 +317,15 @@ run_one() {
 
 	echo "$logger_output"
 
-	qemu_log="$(printf "%s\n" "$logger_output" | sed -n 's/.*QEMU log saved to \([^ ]*\) (.*/\1/p' | tail -n 1)"
-	vm_log="$(printf "%s\n" "$logger_output" | sed -n 's/.*VM   log saved to \([^ ]*\) (.*/\1/p' | tail -n 1)"
-
 	if [ -z "$qemu_log" ] || [ -z "$vm_log" ]; then
 		echo "[batch] failed: logger did not report both log paths, keeping window for inspection" >&2
 		RESULTS+=("run=$index status=logger-failed tag=$tag window=$window_id")
 		BATCH_FAILED=1
+		return 1
+	fi
+
+	if [ "$completion_status" != "ok" ]; then
+		RESULTS+=("run=$index status=$completion_status tag=$tag qemu_log=$qemu_log vm_log=$vm_log live_log=$live_log window=$window_id vm_pane=$VM_PANE")
 		return 1
 	fi
 

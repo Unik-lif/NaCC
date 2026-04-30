@@ -6,6 +6,8 @@ SSH_READY_PROBE_TIMEOUT_SECONDS=10
 SSH_AUTO_TIMEOUT_SECONDS="${VM_SSH_AUTO_TIMEOUT_SECONDS:-120}"
 SSH_BASE_CMD=(ssh -p 2222 root@localhost -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 HAS_SSHPASS=0
+LOGGER_PID=""
+FULL_HISTORY_FILE=""
 
 if command -v sshpass &> /dev/null; then
     HAS_SSHPASS=1
@@ -26,7 +28,7 @@ run_ssh_with_timeout() {
     if [ "$HAS_SSHPASS" -eq 1 ]; then
         timeout --foreground "$timeout_seconds" sshpass -p riscv "$@"
     else
-        "$@"
+        timeout --foreground "$timeout_seconds" "$@"
     fi
 }
 
@@ -62,6 +64,25 @@ wait_for_authenticated_ssh() {
 cleanup() {
     if [ -n "$LOGGER_PID" ]; then
         kill "$LOGGER_PID" 2>/dev/null
+        wait "$LOGGER_PID" 2>/dev/null || true
+        LOGGER_PID=""
+    fi
+    if [ -n "$FULL_HISTORY_FILE" ] && [ -n "${TMUX_PANE:-}" ]; then
+        tmux capture-pane -J -pt "$TMUX_PANE" -S - > "$FULL_HISTORY_FILE" 2>/dev/null || true
+    fi
+}
+
+flush_live_log() {
+    if [ -n "$FULL_HISTORY_FILE" ] && [ -n "${TMUX_PANE:-}" ]; then
+        tmux capture-pane -J -pt "$TMUX_PANE" -S - > "$FULL_HISTORY_FILE" 2>/dev/null || true
+    fi
+}
+
+stop_logger() {
+    if [ -n "$LOGGER_PID" ]; then
+        kill "$LOGGER_PID" 2>/dev/null
+        wait "$LOGGER_PID" 2>/dev/null || true
+        LOGGER_PID=""
     fi
 }
 trap cleanup EXIT
@@ -129,22 +150,27 @@ while true; do
 
     if [ "$HAS_SSHPASS" -ne 1 ]; then
         echo -e "\033[0;31mError: sshpass not found. Falling back to manual password entry.\033[0m"
-        run_ssh "${SSH_CMD[@]}"
+    fi
+
+    if [ -n "$AUTO_CMD" ]; then
+        run_ssh_with_timeout "$SSH_AUTO_TIMEOUT_SECONDS" "${SSH_CMD[@]}"
     else
-        if [ -n "$AUTO_CMD" ]; then
-            run_ssh_with_timeout "$SSH_AUTO_TIMEOUT_SECONDS" "${SSH_CMD[@]}"
-        else
-            run_ssh "${SSH_CMD[@]}"
-        fi
+        run_ssh "${SSH_CMD[@]}"
     fi
     
     EXIT_CODE=$?
     if [ -n "$AUTO_CMD" ]; then
         if [ "$EXIT_CODE" -eq 124 ]; then
             echo "[NaCC][ssh-auto-timeout] remote command exceeded ${SSH_AUTO_TIMEOUT_SECONDS}s"
+        elif [ "$EXIT_CODE" -eq 255 ]; then
+            echo "[NaCC][ssh-auto-retry] code=255"
         else
             echo "[NaCC][ssh-auto-exit] code=$EXIT_CODE"
         fi
+        if [ "$EXIT_CODE" -ne 255 ]; then
+            stop_logger
+        fi
+        flush_live_log
     fi
     
     # If ssh exits with 255, it's usually a connection error (reset, timeout)
