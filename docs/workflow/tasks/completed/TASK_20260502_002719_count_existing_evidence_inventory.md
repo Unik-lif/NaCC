@@ -6,7 +6,7 @@
 - Lane: A
 - Packet Type: execution
 - Owner Role: planner
-- Status: needs_review
+- Status: done
 - Goal: Inventory existing evidence for the immutable count task packet and decide whether the required PRIVATE_DATA attribution report can be produced without code changes.
 - Critical Intent: Read the original immutable `record/count_task_packet.md` as the task source of truth before analyzing artifacts. This slice only inventories existing evidence and determines whether the required attribution closeout can be produced without edits or reruns. Do not infer missing intent from this child packet name.
 - Preferred Shape: Produce a compact artifact map and feasibility matrix for the required count-packet outputs, then recommend the next machine-owned slice: either closeout-report drafting from existing evidence or one narrow attribution repair/collection task.
@@ -74,7 +74,7 @@
 - Stop condition: Stop when the child is archived/returned to the parent or the parent records that the required attribution closeout can be produced from existing evidence.
 - Key Assumptions: `record/count_task_packet.md` remains immutable; `record/20260430_t4_3_private_data_hotspot_closeout.md` is an existing artifact, not a new code or policy change; machine-owned continuation is preferred over human review for this soft workflow uncertainty.
 - If blocked: Record the specific workflow blocker in the parent; do not request a rerun or code repair because the evidence inventory itself found sufficient artifacts.
-- Do not do in next turn: Do not edit `record/count_task_packet.md`, do not modify code, do not rebuild, do not run QEMU, and do not start an optimization implementation.
+- Do not do in this turn: Do not edit `record/count_task_packet.md`, do not modify code, do not rebuild, do not run QEMU, and do not start an optimization implementation.
 
 ## Coder Result
 
