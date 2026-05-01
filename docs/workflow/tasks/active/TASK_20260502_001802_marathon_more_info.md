@@ -5,8 +5,8 @@
 - Priority:
 - Lane: A
 - Packet Type: execution
-- Owner Role: human
-- Status: done
+- Owner Role: planner
+- Status: in_progress
 - Goal: Run a marathon-mode closeout for `record/count_task_packet.md`: produce a decision-oriented PRIVATE_DATA hotspot attribution report that identifies the dominant concrete MEPC family, dominant protected object kind, expected highest-payoff optimization candidate, and whether evidence is sufficient to begin optimization or one narrow attribution repair is still required.
 - Critical Intent: This is attribution closeout and optimization target selection only. Do not infer intent from this packet name or child packet names. Preserve the all-private baseline; no ordinary user page may be unsealed, and no enforcement behavior may be relaxed. Continue through child packets until machine review/log analysis finds the `record/count_task_packet.md` targets fulfilled; organizer is only an auto-dispatch script, not an agent owner.
 - Preferred Shape: Use this packet as the marathon parent/anchor. Split work into small, concrete child packets in `docs/workflow/tasks/active/`, with only one active child representing the current piece of the marathon work at a time. First use existing artifacts; only create minimal attribution-only code changes if existing evidence cannot answer the required questions.
@@ -20,14 +20,14 @@
 - Evidence / Inference Boundary: Evidence must come from existing QEMU logs, final PRIVATE_DATA summaries, MEPC hotspot summaries, `vmlinux.asm`, `System.map`/symbols, prior T4 baseline artifacts, or newly produced attribution-only artifacts if needed. MEPC is kernel instruction address, not user PC. Classifications must distinguish measured evidence from heuristic object-kind inference, and UNKNOWN must be broken down instead of collapsed.
 - Campaign ID: TASK_20260502_001802_marathon_more_info
 - Parent Packet:
-- Active Child Packet: 
+- Active Child Packet: docs/workflow/tasks/active/TASK_20260502_005408_count_fresh_validation_rerun.md
 - Return To Parent On Done: no
 - Continuation Mode: marathon
 - Preflight Resolved: yes
 - Commit Policy: commit_each_completed_unit
 - Reconciliation Required: no
 - Post-Run Analysis Required: no
-- Human Checkpoint Required: no
+- Human Checkpoint Required: soft
 - Definition Of Done: The marathon is done only when the required report answers all ten final questions in `record/count_task_packet.md`, includes all required tables, symbolizes and groups top MEPCs, breaks down `syscall_buffer_path` by concrete MEPC family, produces object-kind and UNKNOWN breakdown summaries, ranks candidate optimizations, recommends exactly one first optimization target or exactly one narrow attribution repair task, and machine review/log analysis accepts that all target requirements have been fulfilled.
 - Related State:
   - `docs/workflow/CURRENT_STATE.md`
@@ -54,11 +54,11 @@
 
 ## Required Artifacts
 
-- Patch or commit: documentation/workflow closeout only; no source-code patch, attribution code, rebuild, or QEMU rerun was needed for this planner closeout.
-- Minimal compile result: not required; campaign closed from existing attribution artifacts and completed child inventory.
-- Test command or batch plan: no new test command; evidence source is the accepted replacement baseline and existing closeout report.
-- Primary log path: `record/20260430_t4_3_private_data_hotspot_closeout.md`
-- Log path if validation fails: not applicable; completed child analysis accepted existing evidence as sufficient.
+- Patch or commit: documentation/workflow closeout only so far; no source-code patch yet.
+- Minimal compile result: deferred to test_runner if the fresh validation requires rebuild.
+- Test command or batch plan: run a fresh bounded T1/T4-style validation batch before closeout; do not rely only on the accepted replacement baseline.
+- Primary log path: pending fresh validation child.
+- Log path if validation fails: pending fresh validation child.
 
 ## Latest Summary
 
@@ -67,18 +67,20 @@
 - Completed child result: existing evidence is sufficient; no attribution repair, source-code edit, rebuild, QEMU rerun, or extra log collection is required before closeout.
 - Closeout artifact accepted for this campaign: `record/20260430_t4_3_private_data_hotspot_closeout.md` answers the required workload table, broad split, MEPC symbolization, family/object summaries, family-by-workload, family-by-broad-category, candidate ranking, UNKNOWN breakdown, and ten final questions from immutable `record/count_task_packet.md`.
 - Auxiliary project state conflict check: `CURRENT_STATE.md`, `HYPOTHESES.md`, and `NEXT_STEPS.md` are older Phase 2 / runtime-context background and do not override this marathon packet's PRIVATE_DATA attribution closeout seed.
-- Campaign status: complete. The next semantic direction, if the human wants to continue, is a new narrow VDSO/VVAR classification experiment packet. Do not continue optimization work under this closeout packet.
+- Human correction on 2026-05-02: do not close this marathon from old evidence only. A fresh validation/test slice is required before final closeout; the previous evidence-inventory child remains useful but is not sufficient to mark the campaign complete.
+- Campaign status: reopened. Next step is a bounded fresh validation child owned by test_runner.
+- Planner update on 2026-05-02: the fresh validation child already exists at `docs/workflow/tasks/active/TASK_20260502_005408_count_fresh_validation_rerun.md`; do not spawn a sibling. The child has been tightened for a test_runner handoff with an exact batch command, log expectations, and a required `log_analyzer` follow-up before parent closeout.
 
 ## Next Handoff
 
-- Next owner: human
-- Trigger: marathon attribution closeout campaign completed from existing evidence
-- Exact artifact to read first: record/20260430_t4_3_private_data_hotspot_closeout.md
-- Exact task for next owner: Read the completed closeout if desired and decide whether to seed a new, separate VDSO/VVAR classification experiment. No machine-owned continuation remains in this packet.
-- Expected deliverable: Human acknowledgment or a fresh task seed for the next optimization-planning campaign; this packet itself needs no further machine route.
-- Stop condition: Stop here for this packet. The count closeout requirements are satisfied and the campaign is complete.
-- If blocked: Not applicable for this completed packet. Any future semantic concern should be seeded as a new packet rather than reopening this closeout campaign.
-- Do not do in this turn: Do not edit `record/count_task_packet.md`, do not implement optimization, do not run QEMU/rebuild for this closeout, and do not start VDSO/VVAR implementation under this packet.
+- Next owner: test_runner
+- Trigger: human rejected old-evidence-only closeout because no new test was run; this parent now has exactly one active fresh-validation child.
+- Exact artifact to read first: docs/workflow/tasks/active/TASK_20260502_005408_count_fresh_validation_rerun.md
+- Exact task for next owner: Continue the active child, not the parent directly. Run the child's exact fresh validation batch, record launcher/per-run logs and workload pass/fail evidence, then route the child to `log_analyzer` for count closeout evidence reduction. Do not mark this parent done until fresh validation is analyzed.
+- Expected deliverable: Updated fresh-validation child packet with concrete Test Result and a `log_analyzer` handoff, followed later by parent closeout only if machine analysis confirms the `record/count_task_packet.md` requirements.
+- Stop condition: Stop only after fresh validation evidence exists and the child is handed to `log_analyzer`, or after a concrete test infrastructure blocker is recorded in the child.
+- If blocked: Record the exact test infrastructure blocker in the child packet, including command, error, and bounded stale-owner/session evidence if relevant; do not close from old evidence only.
+- Do not do in this turn: Do not edit `record/count_task_packet.md`, do not implement optimization, do not spawn a sibling child, and do not mark this parent done until the active child has completed fresh validation and analysis.
 
 ## Coder Result
 
@@ -111,14 +113,14 @@
 
 ## Analysis Result
 
-- Observed symptom: Marathon parent returned from the completed existing-evidence inventory child with sufficient closeout evidence already available.
-- Verdict: acceptable
-- Key evidence: `record/20260430_t4_3_private_data_hotspot_closeout.md` contains all required count-packet outputs and final answers; `docs/workflow/tasks/completed/TASK_20260502_002719_count_existing_evidence_inventory.md` records that no attribution repair, code edit, rebuild, QEMU rerun, or extra collection is needed.
-- Likely cause: The accepted replacement baseline already exposed a dominant `VDSO_TIME_UPDATE` / `VDSO_VVAR_TIME_DATA` pattern, making extra attribution work unnecessary for first-target selection.
-- Confidence: high for campaign closeout sufficiency; medium for PFN-origin/object-origin precision, which remains documented as an evidence boundary rather than a blocker.
-- Human-facing summary: The closeout campaign is complete. Existing evidence points to VDSO/VVAR special classification or kernel-maintained ABI-data treatment as the single first optimization target while preserving all-private ordinary user memory.
-- Recommended next owner: human
-- Recommended next step: If continuing, seed a new narrow VDSO/VVAR classification experiment packet; do not continue under this attribution closeout packet.
+- Observed symptom: Prior marathon parent closeout relied on existing evidence only and did not run a fresh test.
+- Verdict: suspicious
+- Key evidence: The parent's prior Required Artifacts explicitly said "no new test command"; the human rejected that as insufficient for this marathon run.
+- Likely cause: Planner treated `record/count_task_packet.md` section 4 as permission to close from existing artifacts, but did not confirm whether this marathon run required fresh validation for acceptance criterion 1.
+- Confidence: high that the workflow closeout was premature.
+- Human-facing summary: Reopen the campaign and run a fresh validation child before final closeout.
+- Recommended next owner: test_runner via active child `docs/workflow/tasks/active/TASK_20260502_005408_count_fresh_validation_rerun.md`
+- Recommended next step: Run the active fresh-validation child and require logs plus log analysis before marking the parent complete.
 
 ## Open Questions
 
