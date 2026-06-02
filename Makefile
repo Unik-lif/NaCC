@@ -30,8 +30,24 @@ QEMU_DEMO := qemu-demo
 LINUX_SRCDIR := linux
 LINUX_WRKDIR := riscv-linux
 LINUX_MODULES := riscv-linux-modules
+LINUX_KCFLAGS ?= -DNACC
+
+# NaCC log mode:
+#   NACC_LOG_DEBUG=0 (default) keeps routine NaCC diagnostics quiet.
+#   NACC_LOG_DEBUG=1 restores verbose NaCC diagnostics in Linux, OpenSBI,
+#   Agent, and QEMU without changing source files.
+NACC_LOG_DEBUG ?= 0
+ifeq ($(NACC_PROFILE),1)
+LINUX_KCFLAGS += -DNACC_PROFILE
+endif
+ifeq ($(NACC_LOG_DEBUG),1)
+LINUX_KCFLAGS += -DNACC_LOG_DEBUG
+QEMU_EXTRA_CFLAGS += -DNACC_LOG_DEBUG
+endif
 
 AGENT_SRCDIR := agent
+# Override NACC_AGENT_LOG only for component-specific Agent log experiments.
+NACC_AGENT_LOG ?= $(if $(filter 1,$(NACC_LOG_DEBUG)),debug,error)
 
 # Kernel release string used for naming (override via: make rootfs-setup version=...)
 version ?= $(shell cat $(LINUX_WRKDIR)/include/config/kernel.release 2>/dev/null || \
@@ -58,6 +74,25 @@ all: tools qemu opensbi linux linux-modules disk rootfs
 
 .PHONY: update-all
 update-all: qemu opensbi linux linux-modules
+
+.PHONY: approve
+approve:
+	@set -eu; \
+	task="$(TASK)"; \
+	if [ -z "$$task" ]; then \
+		count=$$(find docs/workflow/tasks/active -maxdepth 1 -type f -name 'TASK_*.md' | wc -l | tr -d ' '); \
+		if [ "$$count" -eq 0 ]; then \
+			echo "no active task packet found" >&2; \
+			exit 1; \
+		fi; \
+		if [ "$$count" -gt 1 ]; then \
+			echo "multiple active task packets found; rerun with TASK=<path>" >&2; \
+			find docs/workflow/tasks/active -maxdepth 1 -type f -name 'TASK_*.md' | sort >&2; \
+			exit 1; \
+		fi; \
+		task=$$(find docs/workflow/tasks/active -maxdepth 1 -type f -name 'TASK_*.md' | sort | head -n 1); \
+	fi; \
+	scripts/approve_planner_handoff.sh "$$task"
 
 .PHONY: tools
 tools:
@@ -94,7 +129,7 @@ qemu:
 	@mkdir -p $(QEMU_WRKDIR)
 	@(cd $(QEMU_SRCDIR) && \
 	rm compile_commands.json || true && \
-	./configure --target-list=riscv64-softmmu,riscv64-linux-user --enable-debug --prefix=$(abspath $(QEMU_WRKDIR)) && \
+	./configure --target-list=riscv64-softmmu,riscv64-linux-user --enable-debug --prefix=$(abspath $(QEMU_WRKDIR)) --extra-cflags="$(QEMU_EXTRA_CFLAGS)" && \
 	make -j $$(nproc) && \
 	make install && \
 	cp build/compile_commands.json compile_commands.json && \
@@ -109,7 +144,7 @@ linux-menuconfig:
 	@mkdir -p $(LINUX_WRKDIR)
 	@make -C $(abspath $(LINUX_SRCDIR)) ARCH=riscv mrproper
 	@make -C $(abspath $(LINUX_SRCDIR)) ARCH=riscv clean
-	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- menuconfig
+	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- KCFLAGS="$(LINUX_KCFLAGS)" menuconfig
 	@echo "\033[0;32mLinux kernel configuration saved to $(LINUX_WRKDIR)/.config\033[0m"
 	@cp $(LINUX_WRKDIR)/.config $(CONFIGS)/linux_config
 
@@ -129,8 +164,8 @@ linux:
 	@make -C $(abspath $(LINUX_SRCDIR)) ARCH=riscv mrproper
 	@make -C $(abspath $(LINUX_SRCDIR)) ARCH=riscv clean
 	@cp $(CONFIGS)/linux_config $(LINUX_WRKDIR)/.config
-	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- olddefconfig
-	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- -j $$(nproc)
+	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- KCFLAGS="$(LINUX_KCFLAGS)" olddefconfig
+	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- KCFLAGS="$(LINUX_KCFLAGS)" -j $$(nproc)
 	@(cd $(LINUX_SRCDIR) && \
 	python scripts/clang-tools/gen_compile_commands.py -d $(abspath $(LINUX_WRKDIR)) -o compile_commands.json)
 
@@ -140,7 +175,7 @@ linux-modules:
 	@rm -rf $(LINUX_MODULES)
 	@rm -rf kernel-modules.tar.gz
 	@mkdir -p $(LINUX_MODULES)
-	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- modules_install INSTALL_MOD_PATH=$(abspath $(LINUX_MODULES))
+	make ARCH=riscv -C $(abspath $(LINUX_SRCDIR)) O=$(abspath $(LINUX_WRKDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- KCFLAGS="$(LINUX_KCFLAGS)" modules_install INSTALL_MOD_PATH=$(abspath $(LINUX_MODULES))
 	@echo "\033[0;32mLinux kernel modules installed to $(LINUX_MODULES)\033[0m"
 	@(cd $(LINUX_MODULES)/lib/modules && \
 	tar -cf kernel-modules.tar --exclude='kernel-modules.tar' . && \
@@ -157,9 +192,9 @@ agent-update: agent final-image dump-agent
 .PHONY: agent
 agent: 
 	@echo "\033[0;33mBuilding Agent...\033[0m"
-	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) clean
-	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) all
-	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) objdump
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) LOG=$(NACC_AGENT_LOG) clean
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) LOG=$(NACC_AGENT_LOG) all
+	@make -C $(abspath $(AGENT_SRCDIR)) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-elf- RUN_WITHOUT_PROXY=$(RUN_WITHOUT_PROXY) LOG=$(NACC_AGENT_LOG) objdump
 	@echo "\033[0;32mAgent built successfully\033[0m"
 
 
@@ -175,19 +210,19 @@ final-image:
 .PHONY: opensbi
 opensbi: 
 	@echo "\033[0;33mBuilding OpenSBI...\033[0m"
-	@make -C $(abspath $(OPENSBI_SRCDIR)) clean
+	@make -C $(abspath $(OPENSBI_SRCDIR)) distclean
 	@(cd $(OPENSBI_SRCDIR) && \
 	if command -v bear >/dev/null 2>&1; then \
 		echo "Using bear to capture OpenSBI compile_commands..."; \
-		if $(RUN_WITHOUT_PROXY) bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); then \
+		if $(RUN_WITHOUT_PROXY) bear -- make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- NACC_LOG_DEBUG=$(NACC_LOG_DEBUG) all -j $$(nproc); then \
 			echo "OpenSBI build with bear completed."; \
 		else \
 			echo "bear failed, falling back to plain make for OpenSBI build..."; \
-			make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); \
+			make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- NACC_LOG_DEBUG=$(NACC_LOG_DEBUG) all -j $$(nproc); \
 		fi; \
 	else \
 		echo "bear not found, using plain make for OpenSBI build..."; \
-		make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- all -j $$(nproc); \
+		make PLATFORM=$(OPENSBI_PLATFORM) CROSS_COMPILE=$(abspath $(TOOLCHAIN_WRKDIR))/bin/riscv64-unknown-linux-gnu- NACC_LOG_DEBUG=$(NACC_LOG_DEBUG) all -j $$(nproc); \
 	fi)
 	@$(TOOLCHAIN_WRKDIR)/bin/riscv64-unknown-linux-gnu-objdump -d $(OPENSBI_SRCDIR)/build/platform/generic/firmware/fw_jump.elf > opensbi.asm
 	@echo "\033[0;32mOpenSBI build finished\033[0m"
@@ -294,7 +329,7 @@ launch:
 		-m 5G \
 		-bios $(abspath $(OPENSBI_SRCDIR))/build/platform/generic/firmware/fw_jump.bin \
 		-kernel final_image.bin \
-		-append "root=/dev/vda1 rw console=ttyS0 memmap=1025M\$$0x17ff00000, " \
+		-append "root=/dev/vda1 rw console=ttyS0 memmap=1025M\$$0x17ff00000, $(KERNEL_APPEND)" \
 		-drive file=$(DISK).qcow2,format=qcow2,id=hd0,if=none \
 		-device virtio-blk-device,drive=hd0 \
 		-netdev user,id=net0,hostfwd=tcp::2222-:22 \
@@ -353,6 +388,10 @@ gdb:
 
 # SSH Link to the RISCV-VM
 export VM_AUTO_CMD
+export VM_AUTO_CMD_FILE
+export KERNEL_APPEND
+export VM_SSH_READY_TIMEOUT_SECONDS
+export VM_SSH_AUTO_TIMEOUT_SECONDS
 
 .PHONY: vm
 vm:
